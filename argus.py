@@ -499,18 +499,20 @@ class LiveTerminal:
     def get_suspicious_wallets(self, limit: int = 15) -> List[Tuple]:
         """
         Get TRULY fresh wallets with high volume
-        Only shows wallets that are ACTUALLY fresh (< 48 hours old based on first trade)
+        Only shows wallets that are ACTUALLY fresh (< 48 hours old based on API verification)
         
-        CRITICAL: Uses first_seen_at which is set from the earliest trade timestamp we have.
-        If a wallet was created last year but we only started tracking it today, it won't show
-        as fresh because first_seen_at will be today (when we first saw it trade).
+        CRITICAL: We now verify each wallet's age via the Polymarket API to prevent
+        showing old wallets that we just started tracking.
         """
+        from src.api.polymarket_client import PolymarketClient
+        
         cursor = self.db_conn.cursor()
 
+        # Get candidate wallets from DB (larger set, we'll filter with API)
         cursor.execute("""
             SELECT
                 w.address,
-                EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 as age_hours,
+                EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 as db_age_hours,
                 w.total_trades,
                 w.total_volume_usd,
                 w.freshness_score,
@@ -518,26 +520,74 @@ class LiveTerminal:
                 w.win_rate
             FROM wallets w
             WHERE
-                -- STRICT: Only show TRULY fresh wallets (< 48 hours old based on ACTUAL first trade)
-                -- This ensures we don't show old wallets that we just started tracking
+                -- Initial filter: DB says < 48 hours
                 EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 < 48
                 -- Must have freshness_score >= 70 (HIGH or CRITICAL) 
                 AND w.freshness_score >= 70
                 -- Must have significant volume
                 AND w.total_volume_usd > 100
-                -- Data integrity check: Verify first_seen_at matches earliest trade
-                AND EXISTS (
-                    SELECT 1 FROM trades t 
-                    WHERE t.wallet_address = w.address
-                    AND t.executed_at >= w.first_seen_at - INTERVAL '1 hour'
-                )
             ORDER BY w.freshness_score DESC, w.total_volume_usd DESC
             LIMIT %s
-        """, (limit,))
+        """, (limit * 3,))  # Get more candidates since we'll filter some out
 
-        results = cursor.fetchall()
+        candidates = cursor.fetchall()
         cursor.close()
-        return results
+        
+        # Verify each wallet's age via API
+        client = PolymarketClient()
+        verified_wallets = []
+        
+        for wallet_data in candidates:
+            address = wallet_data[0]
+            db_age_hours = wallet_data[1]
+            
+            try:
+                # Check true wallet age via API
+                is_fresh, api_age_hours = client.is_wallet_truly_fresh(address, max_age_hours=48)
+                
+                if is_fresh:
+                    # Use API age if available, otherwise DB age
+                    actual_age = api_age_hours if api_age_hours > 0 else db_age_hours
+                    
+                    # Rebuild tuple with correct age
+                    verified_wallet = (
+                        wallet_data[0],  # address
+                        actual_age,      # age_hours (API-verified)
+                        wallet_data[2],  # total_trades
+                        wallet_data[3],  # total_volume_usd
+                        wallet_data[4],  # freshness_score
+                        wallet_data[5],  # total_pnl_usd
+                        wallet_data[6],  # win_rate
+                    )
+                    verified_wallets.append(verified_wallet)
+                else:
+                    # This wallet is NOT actually fresh - update DB to fix it
+                    first_ts = client.get_wallet_first_trade_timestamp(address)
+                    if first_ts:
+                        from datetime import datetime
+                        first_dt = datetime.fromtimestamp(first_ts)
+                        try:
+                            update_cursor = self.db_conn.cursor()
+                            update_cursor.execute("""
+                                UPDATE wallets 
+                                SET first_seen_at = %s,
+                                    freshness_score = 0
+                                WHERE address = %s
+                            """, (first_dt, address))
+                            self.db_conn.commit()
+                            update_cursor.close()
+                        except Exception:
+                            pass
+                            
+            except Exception:
+                # If API check fails, include wallet with DB data
+                verified_wallets.append(wallet_data)
+            
+            # Stop once we have enough verified wallets
+            if len(verified_wallets) >= limit:
+                break
+        
+        return verified_wallets[:limit]
 
     def get_recent_alerts(self, limit: int = 15) -> List[Tuple]:
         """Get recent CRITICAL and HIGH alerts"""

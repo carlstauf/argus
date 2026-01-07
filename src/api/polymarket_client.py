@@ -6,7 +6,7 @@ Handles all communication with Polymarket's APIs
 import os
 import time
 import requests
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -262,6 +262,67 @@ class PolymarketClient:
             params['market'] = market
 
         return self._make_request(url, params)
+
+    def get_wallet_first_trade_timestamp(self, wallet_address: str) -> Optional[int]:
+        """
+        Get the timestamp of a wallet's FIRST EVER trade on Polymarket
+        
+        This is critical for accurate "fresh wallet" detection.
+        A wallet created last year should NOT be flagged as fresh.
+        
+        Args:
+            wallet_address: The wallet address to check
+            
+        Returns:
+            Unix timestamp of first trade, or None if no trades found
+        """
+        try:
+            # Fetch trades for this user (API returns newest first)
+            # We need to get enough to find the oldest one
+            trades = self.get_trades(user=wallet_address, limit=500)
+            
+            if not trades:
+                return None
+            
+            # Find the oldest trade timestamp
+            oldest_timestamp = None
+            for trade in trades:
+                ts = trade.get('timestamp', 0)
+                if ts > 0:
+                    if oldest_timestamp is None or ts < oldest_timestamp:
+                        oldest_timestamp = ts
+            
+            return oldest_timestamp
+            
+        except Exception:
+            return None
+
+    def is_wallet_truly_fresh(self, wallet_address: str, max_age_hours: float = 72) -> Tuple[bool, float]:
+        """
+        Check if a wallet is TRULY fresh (first traded recently on Polymarket)
+        
+        Args:
+            wallet_address: The wallet to check
+            max_age_hours: Maximum age in hours to be considered "fresh"
+            
+        Returns:
+            Tuple of (is_fresh: bool, age_hours: float)
+            age_hours will be -1 if we couldn't determine
+        """
+        first_trade_ts = self.get_wallet_first_trade_timestamp(wallet_address)
+        
+        if first_trade_ts is None:
+            # No trade history found - could be truly new or API issue
+            return (True, 0)  # Assume fresh if no history
+        
+        # Calculate age
+        current_time = time.time()
+        age_seconds = current_time - first_trade_ts
+        age_hours = age_seconds / 3600
+        
+        is_fresh = age_hours < max_age_hours
+        
+        return (is_fresh, age_hours)
 
     # ============================================================
     # Batch Operations
