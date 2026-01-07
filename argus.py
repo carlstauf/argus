@@ -498,20 +498,54 @@ class LiveTerminal:
 
     def get_suspicious_wallets(self, limit: int = 15) -> List[Tuple]:
         """
-        Get TRULY fresh wallets with high volume
-        Only shows wallets that are ACTUALLY fresh (< 48 hours old based on API verification)
+        Get TRULY fresh wallets with high volume - targeting TRUE INSIDERS
         
-        CRITICAL: We now verify each wallet's age via the Polymarket API to prevent
-        showing old wallets that we just started tracking.
+        Filters out:
+        - Day traders (wallets with BOTH buy AND sell trades = trading, not conviction)
+        - Crypto gamblers (wallets trading bitcoin, ethereum, up or down markets)
+        - Old wallets we just started tracking (API verified)
         
-        Also filters out day traders (high frequency, many markets).
+        True insiders make ONE-DIRECTIONAL bets on INSIDER markets, not crypto gambling.
         """
         from src.api.polymarket_client import PolymarketClient
         
         cursor = self.db_conn.cursor()
 
-        # Get candidate wallets from DB (larger set, we'll filter with API)
+        # Get candidate wallets from DB with day trader and crypto gambler filtering
         cursor.execute("""
+            WITH day_traders AS (
+                -- Wallets with BOTH buy AND sell trades = day traders, not conviction bettors
+                SELECT wallet_address
+                FROM trades
+                WHERE executed_at >= NOW() - INTERVAL '7 days'
+                GROUP BY wallet_address
+                HAVING 
+                    COUNT(CASE WHEN side = 'BUY' THEN 1 END) > 0 
+                    AND COUNT(CASE WHEN side = 'SELL' THEN 1 END) > 0
+            ),
+            crypto_gamblers AS (
+                -- Wallets trading crypto/gambling markets (no insider edge)
+                SELECT DISTINCT t.wallet_address
+                FROM trades t
+                JOIN markets m ON t.condition_id = m.condition_id
+                WHERE 
+                    t.executed_at >= NOW() - INTERVAL '7 days'
+                    AND (
+                        LOWER(m.question) LIKE '%%bitcoin%%'
+                        OR LOWER(m.question) LIKE '%%btc%%'
+                        OR LOWER(m.question) LIKE '%%ethereum%%'
+                        OR LOWER(m.question) LIKE '%%eth %%'
+                        OR LOWER(m.question) LIKE '%%crypto%%'
+                        OR LOWER(m.question) LIKE '%%up or down%%'
+                        OR LOWER(m.question) LIKE '%%xrp%%'
+                        OR LOWER(m.question) LIKE '%%solana%%'
+                        OR LOWER(m.question) LIKE '%%sol %%'
+                        OR LOWER(m.question) LIKE '%%doge%%'
+                        OR LOWER(m.question) LIKE '%%price above%%'
+                        OR LOWER(m.question) LIKE '%%price below%%'
+                        OR LOWER(m.question) LIKE '%%fdv%%'
+                    )
+            )
             SELECT
                 w.address,
                 EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 as db_age_hours,
@@ -528,7 +562,11 @@ class LiveTerminal:
                 AND w.freshness_score >= 70
                 -- Must have significant volume
                 AND w.total_volume_usd > 100
-                -- EXCLUDE day traders
+                -- EXCLUDE day traders (have both buy and sell)
+                AND w.address NOT IN (SELECT wallet_address FROM day_traders)
+                -- EXCLUDE crypto gamblers
+                AND w.address NOT IN (SELECT wallet_address FROM crypto_gamblers)
+                -- EXCLUDE flagged day traders
                 AND (w.is_day_trader IS NULL OR w.is_day_trader = FALSE)
             ORDER BY w.freshness_score DESC, w.total_volume_usd DESC
             LIMIT %s
