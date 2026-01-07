@@ -215,7 +215,7 @@ class LiveTerminal:
             SELECT 
                 m.condition_id, 
                 m.question, 
-                (SELECT price FROM token_prices WHERE condition_id = m.condition_id ORDER BY timestamp DESC LIMIT 1) as price,
+                (SELECT price FROM trades WHERE condition_id = m.condition_id ORDER BY executed_at DESC LIMIT 1) as price,
                 (SELECT SUM(value_usd) FROM trades WHERE condition_id = m.condition_id AND executed_at > NOW() - INTERVAL '24h') as volume_24h
             FROM markets m
             WHERE 
