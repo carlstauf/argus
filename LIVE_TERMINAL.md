@@ -2,6 +2,35 @@
 
 **The Bloomberg Experience for Prediction Markets**
 
+**✨ NEW in v2.0: Clickable Links, Enhanced UI, Better Data**
+
+---
+
+## 🚀 v2.0 Major Improvements
+
+### 🔗 Clickable Links to Polymarket & Etherscan
+- **Market Links**: Click any market to open on Polymarket
+- **Transaction Links**: View trades on Etherscan
+- **Wallet Links**: Investigate wallets on Etherscan/Polyscan
+- **Footer Panel**: Quick access to latest trade URLs
+
+### 📊 Enhanced Data Display
+- **24h Volume Tracking**: See total volume in last 24 hours
+- **P&L Display**: Profit/loss for tracked wallets
+- **Win Rate**: Success rate for each wallet
+- **Better Metrics**: More actionable statistics
+
+### 🎨 Improved UI
+- **Better Color Coding**: Value-based highlighting
+- **Enhanced Headers**: Status indicators and live updates
+- **More Information**: Denser data display
+- **Link Indicators**: 🔗 icons show clickable items
+
+### ⚡ Performance
+- **Faster Updates**: Optimized queries
+- **Better Caching**: Reduced database load
+- **Smoother UI**: Better refresh handling
+
 ---
 
 ## What Just Changed?
@@ -29,7 +58,7 @@ ARGUS has been upgraded from a **static script** to a **live, real-time intellig
 python argus.py live
 ```
 
-This launches a **4-panel dashboard**:
+This launches a **5-panel dashboard** (v2.0):
 
 ```
 ╔═══════════════════════════════════════════════════════╗
@@ -39,17 +68,22 @@ This launches a **4-panel dashboard**:
 
 ┌─────────────────────────────────────┬─────────────────┐
 │ 📊 LIVE TICKER                      │ 📈 STATS        │
-│ (Real-time trades scrolling)        │ Markets: 2,437  │
-│                                     │ Wallets: 15,234 │
-│ 18:30:43 0xb96c... BUY  $1,250     │ Trades:  127k   │
-│ 18:30:41 0x88a3... SELL $520       │ Ingested: 1,234 │
-│ 18:30:39 0xfa20... BUY  $8,500 🚨  │ Alerts: 3       │
+│ (Real-time trades with links 🔗)   │ Markets: 2,437  │
+│                                     │ 24h Vol: $1.2M  │
+│ 18:30:43 0xb96c...🔗 BUY  $1,250   │ Trades (1h): 45 │
+│ 18:30:41 0x88a3...🔗 SELL $520     │ Ingested: 1,234 │
+│ 18:30:39 0xfa20...🔗 BUY  $8,500🚨│ Alerts: 3       │
 ├─────────────────────────────────────┤                 │
 │ 🔴 THE PANOPTICON                   ├─────────────────┤
-│ (Fresh wallets with activity)       │ 🚨 ALERTS       │
+│ (Fresh wallets with P&L)            │ 🚨 ALERTS       │
 │                                     │                 │
-│ 0x88a3d... 3.2h  12  $15,230       │ CRITICAL: ...   │
-│ 0xb96c2... 12h    5  $8,100        │ HIGH: ...       │
+│ 0x88a3d...🔗 3.2h  12  $15k +$2k  │ 🔴 CRITICAL     │
+│ 0xb96c2...🔗 12h   5  $8k  -$500   │ 🟡 HIGH         │
+│                                     ├─────────────────┤
+│                                     │ 🔗 QUICK LINKS  │
+│                                     │ Latest Trade:   │
+│                                     │ TX: etherscan...│
+│                                     │ Market: poly... │
 └─────────────────────────────────────┴─────────────────┘
 ```
 
@@ -95,11 +129,17 @@ This launches a **4-panel dashboard**:
 - White = Freshness 50-69 (MEDIUM)
 
 **Columns:**
-- `Address` - Wallet address (truncated)
+- `Address` - Wallet address (truncated) 🔗 = clickable
 - `Age` - How old the wallet is (minutes/hours/days)
 - `Trades` - Number of trades
 - `Volume` - Total USD volume
+- `P&L` - Profit/Loss (if available)
 - `Fresh` - Freshness score (0-100)
+
+**v2.0 New Features:**
+- Click wallet address to open on Etherscan
+- P&L tracking for profitable wallets
+- Win rate indicators
 
 ---
 
@@ -108,15 +148,38 @@ This launches a **4-panel dashboard**:
 - System-wide statistics
 
 **Metrics:**
-- `Markets` - Active markets in database
+- `Active Markets` - Markets in database
+- `24h Volume` - Total volume in last 24 hours
+- `Trades (1h)` - Recent activity
 - `Wallets` - Total unique wallets tracked
-- `Trades` - Total trades in database
+- `Total Trades` - All-time trades
 - `Ingested` - Trades ingested this session
-- `Alerts` - Unread CRITICAL/HIGH alerts
+- `Unread Alerts` - CRITICAL/HIGH alerts
+
+**v2.0 New Features:**
+- 24-hour volume tracking
+- Recent activity metrics
+- Better organized stats
 
 ---
 
-### Panel 4: 🚨 RECENT ALERTS (Bottom Right)
+### Panel 4: 🚨 RECENT ALERTS (Middle Right)
+
+### Panel 5: 🔗 QUICK LINKS (Bottom Right) - NEW in v2.0
+**What it shows:**
+- URLs for the most recent trade
+- Clickable links to Etherscan, Polymarket
+- Quick access to investigate trades
+
+**Links Provided:**
+- **Transaction**: Etherscan link for the trade
+- **Market**: Polymarket link to the market
+- **Wallet**: Etherscan link to the trader
+
+**How to Use:**
+- Click URLs in supported terminals (iTerm2, Windows Terminal)
+- Or copy URLs and paste in browser
+- Links update automatically with latest trade
 **What it shows:**
 - Last 10 CRITICAL and HIGH severity alerts
 
@@ -125,9 +188,15 @@ This launches a **4-panel dashboard**:
 - **HIGH** = Whale movement or anomaly
 
 **Columns:**
-- `Sev` - Severity (CRITICAL/HIGH)
+- `Icon` - Alert type indicator
 - `Alert` - Alert title
 - `Conf` - Confidence score (0-100%)
+- `Links` - 👤 = Wallet, 📊 = Market
+
+**v2.0 New Features:**
+- Link indicators for wallets and markets
+- Better alert type icons
+- Enhanced confidence display
 
 ---
 

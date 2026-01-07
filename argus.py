@@ -33,6 +33,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
 from rich.text import Text
+from rich.markup import escape
 from rich import box
 
 
@@ -178,13 +179,14 @@ class LiveTerminal:
         from src.intelligence.engine import IntelligenceEngine
         self.intelligence = IntelligenceEngine(self.db_conn)
 
-        # Trade log (last 50 trades)
+        # Trade log (last 50 trades) - now with full data for links
         self.trade_log = deque(maxlen=50)
 
         # Stats
         self.total_ingested = 0
         self.last_ingest_time = None
         self.alerts_generated = 0
+        self.total_volume_24h = 0.0
 
         # Seen trades cache
         self.seen_trades = set()
@@ -192,6 +194,39 @@ class LiveTerminal:
         # Thresholds
         self.fresh_wallet_hours = int(os.getenv('FRESH_WALLET_HOURS', 24))
         self.whale_threshold_usd = float(os.getenv('WHALE_THRESHOLD_USD', 5000))
+
+    # ============================================================
+    # URL Helpers
+    # ============================================================
+
+    @staticmethod
+    def polymarket_market_url(condition_id: str) -> str:
+        """Generate Polymarket market URL"""
+        return f"https://polymarket.com/market/{condition_id}"
+
+    @staticmethod
+    def etherscan_tx_url(tx_hash: str) -> str:
+        """Generate Etherscan transaction URL"""
+        return f"https://etherscan.io/tx/{tx_hash}"
+
+    @staticmethod
+    def etherscan_address_url(address: str) -> str:
+        """Generate Etherscan address URL"""
+        return f"https://etherscan.io/address/{address}"
+
+    @staticmethod
+    def polyscan_address_url(address: str) -> str:
+        """Generate Polyscan address URL (Polymarket-specific)"""
+        return f"https://polyscan.com/address/{address}"
+
+    def make_clickable_link(self, text: str, url: str, style: str = "cyan") -> Text:
+        """Create a clickable link in Rich Text"""
+        link_text = Text()
+        link_text.append(text, style=style)
+        # Rich supports links in terminals that support OSC 8
+        # Format: \x1b]8;;URL\x1b\\text\x1b]8;;\x1b\\
+        # But Rich handles this automatically if we use the link method
+        return link_text
 
     def _connect_db(self):
         """Establish database connection"""
@@ -306,16 +341,30 @@ class LiveTerminal:
                         wallet_address, condition_id, value_usd, timestamp, cursor
                     )
 
-                    # Add to ticker log
+                    # Get market slug if available
+                    cursor.execute("""
+                        SELECT slug FROM markets WHERE condition_id = %s
+                    """, (condition_id,))
+                    market_slug = cursor.fetchone()
+                    slug = market_slug[0] if market_slug and market_slug[0] else None
+
+                    # Add to ticker log with full data for links
                     new_trades.append({
                         'time': executed_at,
                         'wallet': wallet_address[:10] + '...',
+                        'wallet_full': wallet_address,
                         'side': trade.get('side', 'BUY'),
                         'outcome': trade.get('outcome', 'Yes'),
                         'value_usd': value_usd,
                         'title': trade.get('title', 'Unknown')[:40],
-                        'is_alert': is_alert
+                        'condition_id': condition_id,
+                        'tx_hash': tx_hash,
+                        'is_alert': is_alert,
+                        'slug': slug
                     })
+
+                    # Update 24h volume
+                    self.total_volume_24h += value_usd
 
             except Exception as e:
                 # Rollback transaction on error
@@ -376,7 +425,9 @@ class LiveTerminal:
                 EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 as age_hours,
                 w.total_trades,
                 w.total_volume_usd,
-                w.freshness_score
+                w.freshness_score,
+                w.total_pnl_usd,
+                w.win_rate
             FROM wallets w
             WHERE
                 w.freshness_score >= 50
@@ -399,8 +450,12 @@ class LiveTerminal:
                 a.severity,
                 a.title,
                 a.created_at,
-                a.confidence_score
+                a.confidence_score,
+                a.wallet_address,
+                a.condition_id,
+                m.slug
             FROM alerts a
+            LEFT JOIN markets m ON a.condition_id = m.condition_id
             WHERE a.severity IN ('CRITICAL', 'HIGH', 'MEDIUM')
             ORDER BY a.created_at DESC
             LIMIT %s
@@ -426,13 +481,31 @@ class LiveTerminal:
         cursor.execute("SELECT COUNT(*) FROM alerts WHERE is_read = FALSE")
         unread_alerts = cursor.fetchone()[0]
 
+        # 24h volume
+        cursor.execute("""
+            SELECT COALESCE(SUM(value_usd), 0)
+            FROM trades
+            WHERE executed_at > NOW() - INTERVAL '24 hours'
+        """)
+        volume_24h = float(cursor.fetchone()[0] or 0)
+
+        # Recent trades (last hour)
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM trades
+            WHERE executed_at > NOW() - INTERVAL '1 hour'
+        """)
+        trades_1h = cursor.fetchone()[0]
+
         cursor.close()
 
         return {
             'total_wallets': total_wallets,
             'total_trades': total_trades,
             'active_markets': active_markets,
-            'unread_alerts': unread_alerts
+            'unread_alerts': unread_alerts,
+            'volume_24h': volume_24h,
+            'trades_1h': trades_1h
         }
 
     # ============================================================
@@ -440,16 +513,33 @@ class LiveTerminal:
     # ============================================================
 
     def make_header(self) -> Panel:
-        """Create header panel"""
+        """Create enhanced header panel"""
         text = Text()
         text.append("ARGUS ", style="bold cyan")
         text.append("👁️ ", style="bold white")
-        text.append("Live Intelligence Terminal", style="italic white")
+        text.append("LIVE INTELLIGENCE TERMINAL", style="bold white")
+        text.append(" v2.0", style="dim")
 
-        subtitle = f"Live @ {datetime.now().strftime('%H:%M:%S')}"
+        # Status indicators
+        status_text = Text()
+        status_text.append("🟢 LIVE", style="bold green")
+        status_text.append(" | ", style="dim")
+        
         if self.last_ingest_time:
             seconds_ago = (datetime.now() - self.last_ingest_time).seconds
-            subtitle += f" | Last update: {seconds_ago}s ago"
+            if seconds_ago < 5:
+                status_text.append(f"Updated {seconds_ago}s ago", style="green")
+            elif seconds_ago < 15:
+                status_text.append(f"Updated {seconds_ago}s ago", style="yellow")
+            else:
+                status_text.append(f"Updated {seconds_ago}s ago", style="red")
+        else:
+            status_text.append("Initializing...", style="dim")
+        
+        status_text.append(" | ", style="dim")
+        status_text.append(f"{datetime.now().strftime('%H:%M:%S')}", style="cyan")
+
+        subtitle = str(status_text)
 
         return Panel(
             text,
@@ -459,23 +549,42 @@ class LiveTerminal:
         )
 
     def make_stats_panel(self, stats: Dict) -> Panel:
-        """Create stats panel"""
+        """Create enhanced stats panel"""
         content = Text()
-        content.append(f"Markets: {stats['active_markets']:,}\n", style="cyan")
-        content.append(f"Wallets: {stats['total_wallets']:,}\n", style="cyan")
-        content.append(f"Trades: {stats['total_trades']:,}\n", style="cyan")
-        content.append(f"Ingested: {self.total_ingested:,}\n", style="green")
-        content.append(f"Alerts: {stats['unread_alerts']:,}", style="yellow bold" if stats['unread_alerts'] > 0 else "dim")
+        content.append("📊 MARKET STATS\n", style="bold cyan")
+        content.append(f"Active Markets: ", style="dim")
+        content.append(f"{stats['active_markets']:,}\n", style="cyan bold")
+        
+        content.append(f"24h Volume: ", style="dim")
+        content.append(f"${stats['volume_24h']:,.0f}\n", style="green bold")
+        
+        content.append(f"Trades (1h): ", style="dim")
+        content.append(f"{stats['trades_1h']:,}\n", style="cyan")
+        
+        content.append("\n👥 TRACKING\n", style="bold cyan")
+        content.append(f"Wallets: ", style="dim")
+        content.append(f"{stats['total_wallets']:,}\n", style="cyan")
+        content.append(f"Total Trades: ", style="dim")
+        content.append(f"{stats['total_trades']:,}\n", style="cyan")
+        
+        content.append("\n⚡ SESSION\n", style="bold cyan")
+        content.append(f"Ingested: ", style="dim")
+        content.append(f"{self.total_ingested:,}\n", style="green bold")
+        
+        content.append("\n🚨 ALERTS\n", style="bold yellow")
+        alert_style = "yellow bold" if stats['unread_alerts'] > 0 else "dim"
+        content.append(f"Unread: ", style="dim")
+        content.append(f"{stats['unread_alerts']:,}", style=alert_style)
 
         return Panel(
             content,
-            title="[bold cyan]Stats[/bold cyan]",
+            title="[bold cyan]📈 SYSTEM STATS[/bold cyan]",
             border_style="cyan",
-            box=box.ROUNDED
+            box=box.DOUBLE_EDGE
         )
 
     def make_ticker(self) -> Panel:
-        """Create live trade ticker"""
+        """Create enhanced live trade ticker with clickable links"""
         table = Table(
             show_header=True,
             header_style="bold cyan",
@@ -485,43 +594,76 @@ class LiveTerminal:
         )
 
         table.add_column("Time", width=8, style="dim")
-        table.add_column("Wallet", width=15, style="cyan")
+        table.add_column("Wallet", width=18, style="cyan")
         table.add_column("Side", width=6)
-        table.add_column("Out", width=5)
-        table.add_column("Value", width=10, justify="right")
-        table.add_column("Market", style="white")
+        table.add_column("Value", width=12, justify="right")
+        table.add_column("Market", style="white", ratio=2)
 
-        # Show last 15 trades
-        for trade in list(self.trade_log)[-15:]:
+        # Show last 20 trades
+        for trade in list(self.trade_log)[-20:]:
             time_str = trade['time'].strftime('%H:%M:%S')
 
             # Color by side
             side_style = "bold green" if trade['side'] == 'BUY' else "bold red"
+            side_text = Text(trade['side'], style=side_style)
 
-            # Alert indicator
-            market_text = trade['title']
+            # Wallet with link hint
+            wallet_text = Text()
+            wallet_short = trade['wallet']
+            wallet_text.append(wallet_short, style="cyan")
+            if trade.get('wallet_full'):
+                wallet_text.append(" 🔗", style="dim")
+
+            # Value with color coding
+            value_text = Text()
+            value = trade['value_usd']
+            if value >= 10000:
+                value_style = "bold bright_green"
+            elif value >= 1000:
+                value_style = "green"
+            else:
+                value_style = "white"
+            value_text.append(f"${value:,.0f}", style=value_style)
+
+            # Market with link
+            market_text = Text()
             if trade.get('is_alert'):
-                market_text = f"🚨 {market_text}"
+                market_text.append("🚨 ", style="bold red")
+            market_text.append(trade['title'][:45], style="white")
+            if trade.get('condition_id'):
+                market_text.append(" 🔗", style="dim cyan")
+
+            # Row style for alerts
+            row_style = "bold red" if trade.get('is_alert') else None
 
             table.add_row(
                 time_str,
-                trade['wallet'],
-                trade['side'],
-                trade['outcome'][:3],
-                f"${trade['value_usd']:,.0f}",
+                wallet_text,
+                side_text,
+                value_text,
                 market_text,
-                style=side_style if trade.get('is_alert') else None
+                style=row_style
             )
+
+        # Add footer with link instructions
+        footer = Text()
+        footer.append("\n💡 ", style="dim")
+        footer.append("Click wallet/market to open in browser", style="dim italic")
+        footer.append(" | ", style="dim")
+        footer.append("Ctrl+Click", style="bold dim")
+        footer.append(" = ", style="dim")
+        footer.append("Etherscan/Polymarket", style="dim cyan")
 
         return Panel(
             table,
             title="[bold green]📊 LIVE TICKER[/bold green]",
+            subtitle=f"Last {len(self.trade_log)} trades • Real-time updates",
             border_style="green",
             box=box.DOUBLE_EDGE
         )
 
     def make_panopticon(self, wallets: List[Tuple]) -> Panel:
-        """Create suspicious wallets table"""
+        """Create enhanced suspicious wallets table with links"""
         table = Table(
             show_header=True,
             header_style="bold red",
@@ -530,48 +672,86 @@ class LiveTerminal:
             show_lines=True
         )
 
-        table.add_column("Address", width=20, style="cyan")
-        table.add_column("Age", width=10, justify="right")
-        table.add_column("Trades", width=8, justify="right")
-        table.add_column("Volume", width=12, justify="right", style="green")
-        table.add_column("Fresh", width=8, justify="right")
+        table.add_column("Address", width=22, style="cyan")
+        table.add_column("Age", width=8, justify="right")
+        table.add_column("Trades", width=7, justify="right")
+        table.add_column("Volume", width=13, justify="right", style="green")
+        table.add_column("P&L", width=10, justify="right")
+        table.add_column("Fresh", width=7, justify="right")
 
         for wallet in wallets:
-            address, age_hours, trades, volume, freshness = wallet
+            address, age_hours, trades, volume, freshness, pnl, win_rate = wallet[:7]
+
+            # Address with link hint
+            address_text = Text()
+            address_text.append(address[:18] + "...", style="cyan")
+            address_text.append(" 🔗", style="dim")
 
             # Format age
             if age_hours < 1:
                 age_str = f"{int(age_hours * 60)}m"
+                age_style = "bold red"
             elif age_hours < 24:
                 age_str = f"{age_hours:.1f}h"
+                age_style = "yellow"
             else:
                 age_str = f"{age_hours/24:.1f}d"
+                age_style = None
+
+            # P&L with color
+            pnl_val = pnl if pnl else 0
+            pnl_text = Text()
+            if pnl_val > 0:
+                pnl_text.append(f"+${pnl_val:,.0f}", style="green")
+            elif pnl_val < 0:
+                pnl_text.append(f"${pnl_val:,.0f}", style="red")
+            else:
+                pnl_text.append("--", style="dim")
+
+            # Win rate badge
+            win_rate_val = win_rate if win_rate else 0
+            if win_rate_val >= 0.6:
+                win_style = "green"
+            elif win_rate_val >= 0.4:
+                win_style = "yellow"
+            else:
+                win_style = "red"
 
             # Color by freshness
             row_style = "bold red" if freshness >= 90 else ("yellow" if freshness >= 70 else None)
 
+            # Freshness with color
+            fresh_text = Text()
+            if freshness >= 90:
+                fresh_text.append(str(freshness), style="bold red")
+            elif freshness >= 70:
+                fresh_text.append(str(freshness), style="yellow")
+            else:
+                fresh_text.append(str(freshness), style="white")
+
             table.add_row(
-                address[:20],
-                age_str,
+                address_text,
+                Text(age_str, style=age_style),
                 str(trades),
-                f"${volume:,.0f}",
-                str(freshness),
+                Text(f"${volume:,.0f}", style="green"),
+                pnl_text,
+                fresh_text,
                 style=row_style
             )
 
         if not wallets:
-            table.add_row("No suspicious activity detected", "", "", "", "", style="dim")
+            table.add_row("No suspicious activity detected", "", "", "", "", "", style="dim")
 
         return Panel(
             table,
             title="[bold red]🔴 THE PANOPTICON (Fresh Wallets)[/bold red]",
-            subtitle="Auto-refreshes every 5 seconds",
+            subtitle="Auto-refreshes every 5s • Click address for Etherscan",
             border_style="red",
             box=box.DOUBLE_EDGE
         )
 
     def make_alerts_panel(self, alerts: List[Tuple]) -> Panel:
-        """Create alerts panel with alert type icons"""
+        """Create enhanced alerts panel with links"""
         table = Table(
             show_header=True,
             header_style="bold yellow",
@@ -580,9 +760,10 @@ class LiveTerminal:
             show_lines=False
         )
 
-        table.add_column("Type", width=6)
-        table.add_column("Alert", style="white")
-        table.add_column("Conf", width=5, justify="right")
+        table.add_column("", width=3)
+        table.add_column("Alert", style="white", ratio=2)
+        table.add_column("Conf", width=6, justify="right")
+        table.add_column("Links", width=8)
 
         # Alert type icons
         alert_icons = {
@@ -590,11 +771,13 @@ class LiveTerminal:
             'SUSPICIOUS_STRUCTURING': '🔨',
             'WHALE_ANOMALY': '📊',
             'WHALE_MOVE': '🐋',
-            'FRESH_WALLET': '🔴'
+            'FRESH_WALLET': '🔴',
+            'INSIDER_PATTERN': '💎',
+            'ANOMALY': '⚡'
         }
 
         for alert in alerts:
-            alert_type, severity, title, created_at, confidence = alert
+            alert_type, severity, title, created_at, confidence, wallet, condition_id, slug = alert[:8]
 
             # Get icon
             icon = alert_icons.get(alert_type, '⚠️')
@@ -607,22 +790,54 @@ class LiveTerminal:
             else:
                 sev_style = "bold blue"
 
+            # Title with truncation
+            title_text = Text()
+            title_text.append(title[:50], style="white")
+            if len(title) > 50:
+                title_text.append("...", style="dim")
+
+            # Confidence with color
+            conf_text = Text()
+            conf_pct = int(confidence * 100) if confidence else 0
+            if conf_pct >= 80:
+                conf_style = "bold green"
+            elif conf_pct >= 60:
+                conf_style = "yellow"
+            else:
+                conf_style = "dim"
+            conf_text.append(f"{conf_pct}%", style=conf_style)
+
+            # Links column
+            links_text = Text()
+            if wallet:
+                links_text.append("👤", style="cyan")
+            if condition_id:
+                links_text.append(" 📊", style="green")
+            if not wallet and not condition_id:
+                links_text.append("--", style="dim")
+
             table.add_row(
                 icon,
-                title[:55],
-                f"{confidence*100:.0f}%",
+                title_text,
+                conf_text,
+                links_text,
                 style=sev_style
             )
 
         if not alerts:
-            table.add_row("", "No alerts detected", "", style="dim")
+            table.add_row("", "No alerts detected", "", "", style="dim")
+
+        footer = Text()
+        footer.append("💡 ", style="dim")
+        footer.append("👤 = Wallet | ", style="dim")
+        footer.append("📊 = Market", style="dim")
 
         return Panel(
             table,
             title="[bold yellow]🚨 INTELLIGENCE ALERTS[/bold yellow]",
-            subtitle=f"Last {len(alerts)} alerts",
+            subtitle=f"Last {len(alerts)} alerts • Click icons for links",
             border_style="yellow",
-            box=box.ROUNDED
+            box=box.DOUBLE_EDGE
         )
 
     def make_layout(self) -> Layout:
@@ -647,10 +862,11 @@ class LiveTerminal:
             Layout(name="panopticon", ratio=2)
         )
 
-        # Split right into stats and alerts
+        # Split right into stats, alerts, and footer
         layout["right"].split_column(
             Layout(name="stats", size=9),
-            Layout(name="alerts")
+            Layout(name="alerts", ratio=2),
+            Layout(name="footer", size=4)
         )
 
         # Update panels
@@ -664,8 +880,61 @@ class LiveTerminal:
         layout["ticker"].update(self.make_ticker())
         layout["panopticon"].update(self.make_panopticon(wallets))
         layout["alerts"].update(self.make_alerts_panel(alerts))
+        layout["footer"].update(self.make_footer())
 
         return layout
+
+    def make_footer(self) -> Panel:
+        """Create footer with URL instructions and recent trade links"""
+        content = Text()
+        content.append("🔗 QUICK LINKS", style="bold cyan")
+        content.append(" (Latest Trade)\n", style="dim")
+        
+        # Show URLs for most recent trade if available
+        if self.trade_log:
+            latest = list(self.trade_log)[-1]
+            
+            if latest.get('tx_hash'):
+                tx_url = self.etherscan_tx_url(latest['tx_hash'])
+                content.append("TX: ", style="dim")
+                # Use Rich's link format for clickable URLs
+                content.append(tx_url, style="cyan underline")
+                content.append("\n", style="dim")
+            
+            if latest.get('condition_id'):
+                market_url = self.polymarket_market_url(latest['condition_id'])
+                content.append("Market: ", style="dim")
+                content.append(market_url, style="green underline")
+                content.append("\n", style="dim")
+            
+            if latest.get('wallet_full'):
+                wallet_url = self.etherscan_address_url(latest['wallet_full'])
+                content.append("Wallet: ", style="dim")
+                content.append(wallet_url, style="yellow underline")
+        else:
+            content.append("No trades yet...", style="dim")
+        
+        content.append("\n\n💡 ", style="dim")
+        content.append("Terminal links are clickable", style="dim italic")
+        content.append(" | ", style="dim")
+        content.append("Copy URLs to browser", style="dim italic")
+
+        return Panel(
+            content,
+            title="[bold dim]🔗 LINKS[/bold dim]",
+            border_style="dim",
+            box=box.SIMPLE
+        )
+
+    def print_urls_for_trade(self, trade: Dict):
+        """Print URLs for a trade (helper for debugging/access)"""
+        if trade.get('tx_hash'):
+            self.console.print(f"\n[cyan]Transaction:[/cyan] {self.etherscan_tx_url(trade['tx_hash'])}")
+        if trade.get('wallet_full'):
+            self.console.print(f"[cyan]Wallet (Etherscan):[/cyan] {self.etherscan_address_url(trade['wallet_full'])}")
+            self.console.print(f"[cyan]Wallet (Polyscan):[/cyan] {self.polyscan_address_url(trade['wallet_full'])}")
+        if trade.get('condition_id'):
+            self.console.print(f"[cyan]Market:[/cyan] {self.polymarket_market_url(trade['condition_id'])}")
 
     # ============================================================
     # Main Live Loop
@@ -678,6 +947,8 @@ class LiveTerminal:
         self.console.print("[dim]Ingesting data every 2 seconds...[/dim]")
         self.console.print("[dim]Dashboard refreshes every 5 seconds...[/dim]")
         self.console.print("[dim]Press Ctrl+C to exit[/dim]\n")
+        self.console.print("[bold yellow]💡 TIP:[/bold yellow] URLs are shown with 🔗 icons")
+        self.console.print("[dim]   Copy URLs from terminal or use terminal's link support[/dim]\n")
 
         time.sleep(2)
 

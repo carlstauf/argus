@@ -1,36 +1,108 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ARGUS Command Center - Frontend
+
+The web frontend for ARGUS Command Center, built with Next.js 14, TypeScript, and Tailwind CSS.
+
+## Features
+
+- **Real-time Dashboard**: Live trade monitoring with WebSocket integration
+- **The Panopticon**: High-performance trade table with sorting and filtering
+- **Live Feed**: Real-time trade stream with alert highlighting
+- **Intelligence Alerts**: Severity-based alert system with confidence scores
+- **Responsive Design**: Mobile-first design that works on all devices
 
 ## Getting Started
 
-First, run the development server:
+### Prerequisites
+
+- Node.js 18+ and npm
+- Backend API running on `http://localhost:8000`
+
+### Installation
 
 ```bash
+# Install dependencies
+npm install
+
+# Run development server
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) to view the dashboard.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Environment Variables
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Create a `.env.local` file in the `web` directory:
 
-## Learn More
+```bash
+NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws/live
+```
 
-To learn more about Next.js, take a look at the following resources:
+For production, use `wss://` for secure WebSocket connections.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Project Structure
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```
+web/
+├── app/                    # Next.js app directory
+│   ├── page.tsx           # Main dashboard page
+│   ├── layout.tsx         # Root layout
+│   └── globals.css        # Global styles
+├── components/
+│   ├── dashboard/         # Dashboard components
+│   │   ├── TopBar.tsx     # Top navigation bar
+│   │   ├── PanopticonTable.tsx  # Main trade table
+│   │   ├── LiveFeed.tsx   # Live trade feed
+│   │   └── AlertsStream.tsx     # Alert stream
+│   └── ui/                # Reusable UI components
+├── hooks/
+│   └── useWebSocket.ts    # WebSocket hook
+└── lib/
+    └── utils.ts           # Utility functions
+```
 
-## Deploy on Vercel
+## Tech Stack
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- **Next.js 14**: React framework with App Router
+- **TypeScript**: Type safety
+- **Tailwind CSS**: Utility-first CSS
+- **TanStack Table**: High-performance table component
+- **Lucide React**: Icon library
+- **WebSocket API**: Real-time data streaming
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Development
+
+```bash
+# Development server
+npm run dev
+
+# Build for production
+npm run build
+
+# Start production server
+npm start
+
+# Lint code
+npm run lint
+```
+
+## Deployment
+
+See the main [DEPLOYMENT.md](../DEPLOYMENT.md) for deployment instructions.
+
+### Vercel Deployment
+
+1. Push your code to GitHub
+2. Import project in Vercel
+3. Set environment variable `NEXT_PUBLIC_WS_URL` to your production WebSocket URL
+4. Deploy!
+
+## WebSocket Protocol
+
+The frontend connects to the backend WebSocket endpoint at `/ws/live` and receives:
+
+- **Init messages**: Initial data load with trades and alerts
+- **Trade updates**: New trades as they occur
+- **Alert updates**: Intelligence alerts from the engine
+- **Stats updates**: Real-time statistics
+
+See [README_WEB.md](../README_WEB.md) for detailed WebSocket protocol documentation.
