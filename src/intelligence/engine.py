@@ -68,15 +68,30 @@ class IntelligenceEngine:
         # Market Classification: Filter for Insider-Potential Markets
         # ============================================================
         
-        # GAMBLING MARKETS - these are NOT skipped anymore
-        # (kept for reference but not used for filtering)
+        # GAMBLING MARKETS - Filtered out for FRESH WALLET detection
+        # These are pure speculation/gambling with no insider edge
         self.gambling_patterns = [
-            'up or down',           # Crypto price gambling
+            # Crypto price gambling - no insider edge, pure speculation
+            'up or down',           # "Will BTC go up or down"
+            'bitcoin',              # Bitcoin price markets
+            'btc',                  # BTC price markets  
+            'ethereum',             # ETH price markets
+            'eth',                  # ETH price markets
+            'crypto',               # Crypto price markets
+            'price above',          # Price target gambling
+            'price below',          # Price target gambling
+            'above $',              # Price thresholds
+            'below $',              # Price thresholds
+            'ath',                  # All-time high speculation
+            'all-time high',        # All-time high speculation
+            # Sports gambling - bookmakers have edge, not insiders
             'o/u ',                 # Sports over/under
             'over/under',           # Sports over/under
             'spread:',              # Sports spreads
+            # Random outcomes - no insider edge possible
             'highest temperature',  # Weather (random)
             'earthquakes',          # Natural events (random)
+            'lottery',              # Random chance
         ]
         
         # HIGH INSIDER POTENTIAL MARKETS - Prioritize these (+15% confidence boost)
@@ -172,7 +187,7 @@ class IntelligenceEngine:
 
         # Run all detection algorithms concurrently
         results = await asyncio.gather(
-            self.detect_fresh_wallet(wallet_address, value_usd),
+            self.detect_fresh_wallet(wallet_address, value_usd, condition_id),
             self.detect_hammer_pattern(wallet_address, condition_id, value_usd),
             self.detect_unusual_sizing(condition_id, value_usd),
             self.detect_proven_winner(wallet_address, value_usd, condition_id),
@@ -693,17 +708,18 @@ class IntelligenceEngine:
     # Detection Algorithm 1: Fresh Wallet (The Burner Check)
     # ============================================================
 
-    async def detect_fresh_wallet(self, wallet_address: str, value_usd: float) -> Optional[Dict]:
+    async def detect_fresh_wallet(self, wallet_address: str, value_usd: float, condition_id: str = None) -> Optional[Dict]:
         """
-        Detect brand-new wallets making large bets
+        Detect brand-new wallets making large bets - targeting TRUE INSIDERS
 
         Strategy:
-        1. First check Polymarket API for wallet's TRUE first trade date
-        2. If API check fails, fall back to database first_seen_at
-        3. If < 72h old AND bet > $1k → CRITICAL ALERT
+        1. SKIP gambling/crypto price markets (no insider edge there)
+        2. SKIP wallets that are day trading (buy/sell cycles on same contract)
+        3. Check Polymarket API for wallet's TRUE first trade date
+        4. If < 72h old AND bet > $1k → CRITICAL ALERT
 
-        IMPORTANT: We now verify wallet age via API to prevent false positives
-        on old wallets that we just started tracking.
+        IMPORTANT: We focus on insiders with special information, NOT day traders
+        gambling on price movements or churning positions.
 
         Returns alert dict or None
         """
@@ -711,6 +727,18 @@ class IntelligenceEngine:
         # Only check if trade is significant
         if value_usd < self.fresh_wallet_min_usd:
             return None
+
+        # STEP 0: Filter out gambling/crypto markets - no insider edge
+        if condition_id:
+            market_type, _ = await self._classify_market(condition_id)
+            if market_type == 'GAMBLING':
+                return None  # Skip crypto price gambling, sports spreads, etc.
+            
+            # STEP 0.5: Check if wallet is churning THIS SPECIFIC contract
+            # Day traders buy AND sell the same contract repeatedly - not insider behavior
+            is_churning = await self._is_churning_market(wallet_address, condition_id)
+            if is_churning:
+                return None  # Skip - this is day trading, not insider conviction
 
         try:
             # STEP 1: Check Polymarket API for TRUE wallet history
