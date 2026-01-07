@@ -23,9 +23,9 @@ class GeminiOracle:
 
         try:
             genai.configure(api_key=api_key)
-            # Use Flash 1.5 for speed and efficiency
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
-            logger.info("Gemini Oracle initialized successfully")
+            # Use Gemini 3.0 Flash (Preview) as requested
+            self.model = genai.GenerativeModel('gemini-3-flash-preview')
+            logger.info("Gemini Oracle initialized (Model: gemini-3-flash-preview)")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini Oracle: {e}")
             self.model = None

@@ -178,10 +178,15 @@ class LiveTerminal:
 
         # Initialize Intelligence Engine
         from src.intelligence.engine import IntelligenceEngine
+        from src.intelligence.oracle import GeminiOracle
         self.intelligence = IntelligenceEngine(self.db_conn)
+        self.oracle = GeminiOracle()
 
-        # Trade log (last 50 trades) - now with full data for links
+        # Trade log (last 50 trades)
         self.trade_log = deque(maxlen=50)
+        
+        # Oracle insights cache
+        self.oracle_insights = []
 
         # Stats
         self.total_ingested = 0
@@ -195,6 +200,48 @@ class LiveTerminal:
         # Thresholds
         self.fresh_wallet_hours = int(os.getenv('FRESH_WALLET_HOURS', 24))
         self.whale_threshold_usd = float(os.getenv('WHALE_THRESHOLD_USD', 5000))
+
+    async def ingest_oracle(self) -> List[Dict]:
+        """
+        Background process to feed markets to the Oracle
+        Runs less frequently (every 10s) to respect API limits
+        """
+        if not self.oracle.model:
+            return []
+            
+        # Get top active markets from DB for analysis
+        cursor = self.db_conn.cursor()
+        cursor.execute("""
+            SELECT 
+                m.condition_id, 
+                m.question, 
+                (SELECT price FROM token_prices WHERE condition_id = m.condition_id ORDER BY timestamp DESC LIMIT 1) as price,
+                (SELECT SUM(value_usd) FROM trades WHERE condition_id = m.condition_id AND executed_at > NOW() - INTERVAL '24h') as volume_24h
+            FROM markets m
+            WHERE 
+                m.active = TRUE 
+                AND m.question NOT LIKE '%%vs%%' -- Ignore sports for now to focus on events
+                AND m.question NOT LIKE '%%Bitcoin%%'
+            ORDER BY volume_24h DESC
+            LIMIT 20
+        """)
+        
+        markets = []
+        for row in cursor.fetchall():
+            markets.append({
+                'condition_id': row[0],
+                'question': row[1],
+                'price': float(row[2]) if row[2] else 0.5,
+                'volume_24h': float(row[3]) if row[3] else 0
+            })
+        cursor.close()
+        
+        # Scan for mispricing
+        insights = await self.oracle.scan_markets(markets)
+        if insights:
+            self.oracle_insights = insights
+            
+        return insights
 
     # ============================================================
     # URL Helpers
@@ -979,35 +1026,89 @@ class LiveTerminal:
             Layout(name="body")
         )
 
-        # Split body into left (Insiders) and right (Feed/Alerts)
+        # Split body into Left (Insiders) and Right (Oracle)
         layout["body"].split_row(
             Layout(name="left", ratio=4),
             Layout(name="right", ratio=6)
         )
 
-        # Left column: JUST Insider Candidates (Panopticon)
-        layout["left"].update(self.make_panopticon(self.get_suspicious_wallets(20)))
-
-        # Right column: Split into Feed, Signals, Stats
-        layout["right"].split_column(
-            Layout(name="ticker", ratio=4),
-            Layout(name="alerts", ratio=3),
-            Layout(name="stats", size=9),
-            Layout(name="footer", size=3)
-        )
-
         # Update panels
         layout["header"].update(self.make_header())
+        
+        # Left: Panopticon (Insiders)
+        layout["left"].update(self.make_panopticon(self.get_suspicious_wallets(20)))
 
-        stats = self.get_stats()
-        alerts = self.get_recent_alerts(10)
-
-        layout["ticker"].update(self.make_ticker())
-        layout["alerts"].update(self.make_alerts_panel(alerts))
-        layout["stats"].update(self.make_stats_panel(stats))
-        layout["footer"].update(self.make_footer())
+        # Right: The Oracle (AI Analysis) - TAKEOVER
+        layout["right"].update(self.make_oracle_panel(self.oracle_insights))
 
         return layout
+
+    def make_oracle_panel(self, insights: List[Dict]) -> Panel:
+        """Create THE ORACLE panel - AI Reality Check"""
+        table = Table(
+            show_header=True,
+            header_style="bold yellow",
+            box=box.SIMPLE,
+            expand=True,
+            show_lines=False
+        )
+
+        table.add_column("Market", style="white", ratio=2)
+        table.add_column("Mkt %", justify="right", style="dim white", width=6)
+        table.add_column("Real %", justify="right", style="bold green", width=6)
+        table.add_column("Verdict", justify="center", width=12)
+        table.add_column("Reasoning", style="dim", ratio=3)
+
+        if not self.oracle.model:
+            # Disabled state
+            return Panel(
+                Text("\nGemini API Key missing. Oracle disabled.\n", justify="center", style="yellow"),
+                title="[bold yellow]👁️ THE ORACLE[/bold yellow]",
+                border_style="yellow",
+                box=box.ROUNDED
+            )
+
+        if not insights:
+            # Loading or empty state
+            empty_text = Text("\nWaiting for visions...\nScanning markets for reality gaps...", style="dim italic", justify="center")
+            return Panel(
+                empty_text,
+                title="[bold yellow]👁️ THE ORACLE[/bold yellow]",
+                subtitle="Scanning for Mispriced Reality",
+                border_style="yellow",
+                box=box.ROUNDED
+            )
+
+        for item in insights:
+            q = item.get('question', 'Unknown')
+            mkt_prob = item.get('market_price', 0) * 100
+            real_prob = item.get('estimated_real_odds', 0)
+            verdict = item.get('verdict', 'UNKNOWN')
+            reason = item.get('reasoning', '')
+            
+            # Format Verdict
+            if verdict == 'UNDERVALUED':
+                verdict_styled = "[bold green]BUY YES[/bold green]"
+            elif verdict == 'OVERVALUED':
+                verdict_styled = "[bold red]SELL YES[/bold red]"
+            else:
+                verdict_styled = f"[dim]{verdict}[/dim]"
+
+            table.add_row(
+                q,
+                f"{mkt_prob:.0f}%",
+                f"{real_prob:.0f}%",
+                verdict_styled,
+                reason
+            )
+
+        return Panel(
+            table,
+            title="[bold yellow]👁️ THE ORACLE[/bold yellow]",
+            subtitle="AI Reality Check (Gemini 1.5)",
+            border_style="yellow",
+            box=box.ROUNDED
+        )
 
     def make_footer(self) -> Panel:
         """Create footer with clickable URL links"""
@@ -1088,6 +1189,7 @@ class LiveTerminal:
         try:
             with Live(self.make_layout(), refresh_per_second=4, console=self.console) as live:
                 last_dashboard_update = time.time()
+                last_oracle_update = 0
 
                 while True:
                     # Ingest new trades every 2 seconds
@@ -1102,6 +1204,11 @@ class LiveTerminal:
                     if current_time - last_dashboard_update >= 5:
                         live.update(self.make_layout())
                         last_dashboard_update = current_time
+                    
+                    # Update ORACLE every 15 seconds
+                    if current_time - last_oracle_update >= 15:
+                        await self.ingest_oracle()
+                        last_oracle_update = current_time
 
                     await asyncio.sleep(2)
 
