@@ -534,6 +534,8 @@ class LiveTerminal:
                     MAX(value_usd) as biggest_trade,
                     SUM(value_usd) as total_volume,
                     MIN(executed_at) as first_trade,
+                    -- Get the question of the biggest trade
+                    (ARRAY_AGG(question ORDER BY value_usd DESC))[1] as biggest_market_question,
                     -- Check if ANY trade is on gambling markets
                     BOOL_OR(
                         LOWER(question) LIKE '%%vs.%%' OR
@@ -558,8 +560,8 @@ class LiveTerminal:
                 EXTRACT(EPOCH FROM (NOW() - wa.first_trade)) / 3600 as age_hours,
                 wa.trade_count,
                 wa.total_volume,
-                100 as freshness_score,  -- All are fresh by definition
-                0 as pnl,
+                100 as freshness_score,
+                wa.biggest_market_question,    -- Returning Question instead of P&L
                 0 as win_rate
             FROM wallet_activity wa
             WHERE 
@@ -820,81 +822,41 @@ class LiveTerminal:
         )
 
     def make_panopticon(self, wallets: List[Tuple]) -> Panel:
-        """Create enhanced suspicious wallets table with links"""
+        """Create enhanced fresh wallet monitor"""
         table = Table(
             show_header=True,
-            header_style="bold red",
+            header_style="bold magenta",
             box=box.SIMPLE,
             expand=True,
-            show_lines=True
+            show_lines=False
         )
 
-        table.add_column("Address", width=22, style="cyan")
-        table.add_column("Age", width=8, justify="right")
-        table.add_column("Trades", width=7, justify="right")
-        table.add_column("Volume", width=13, justify="right", style="green")
-        table.add_column("P&L", width=10, justify="right")
-        table.add_column("Fresh", width=7, justify="right")
+        table.add_column("Address", style="dim cyan", no_wrap=True, width=14)
+        table.add_column("Age", justify="right", style="yellow", width=4)
+        table.add_column("Bet", justify="right", style="bold green", width=8)
+        table.add_column("Target Market", style="white", ratio=1, no_wrap=True)
 
         for wallet in wallets:
-            address, age_hours, trades, volume, freshness, pnl, win_rate = wallet[:7]
+            # Tuple: (addr, age, trades, vol, fresh, question, win_rate)
+            address = wallet[0]
+            age_hours = wallet[1]
+            volume_usd = wallet[3]
+            question = wallet[5] if len(wallet) > 5 else "Unknown"
 
-            # Address with clickable Polymarket profile link
-            address_text = Text()
-            wallet_url = self.polymarket_profile_url(address)
-            link_style = Style(link=wallet_url, color="cyan", underline=True)
-            address_text.append(address[:18] + "...", style=link_style)
-
+            # Format address
+            address_disp = f"{address[:6]}...{address[-4:]}"
+            
             # Format age
             if age_hours < 1:
-                age_str = f"{int(age_hours * 60)}m"
-                age_style = "bold red"
-            elif age_hours < 24:
+                age_str = "<1h"
+            else:
                 age_str = f"{age_hours:.1f}h"
-                age_style = "yellow"
-            else:
-                age_str = f"{age_hours/24:.1f}d"
-                age_style = None
-
-            # P&L with color
-            pnl_val = pnl if pnl else 0
-            pnl_text = Text()
-            if pnl_val > 0:
-                pnl_text.append(f"+${pnl_val:,.0f}", style="green")
-            elif pnl_val < 0:
-                pnl_text.append(f"${pnl_val:,.0f}", style="red")
-            else:
-                pnl_text.append("--", style="dim")
-
-            # Win rate badge
-            win_rate_val = win_rate if win_rate else 0
-            if win_rate_val >= 0.6:
-                win_style = "green"
-            elif win_rate_val >= 0.4:
-                win_style = "yellow"
-            else:
-                win_style = "red"
-
-            # Color by freshness
-            row_style = "bold red" if freshness >= 90 else ("yellow" if freshness >= 70 else None)
-
-            # Freshness with color
-            fresh_text = Text()
-            if freshness >= 90:
-                fresh_text.append(str(freshness), style="bold red")
-            elif freshness >= 70:
-                fresh_text.append(str(freshness), style="yellow")
-            else:
-                fresh_text.append(str(freshness), style="white")
 
             table.add_row(
-                address_text,
-                Text(age_str, style=age_style),
-                str(trades),
-                Text(f"${volume:,.0f}", style="green"),
-                pnl_text,
-                fresh_text,
-                style=row_style
+                address_disp,
+                age_str,
+                f"${volume_usd:,.0f}",
+                question
             )
 
         if not wallets:
@@ -902,13 +864,13 @@ class LiveTerminal:
             empty_text = Text()
             empty_text.append("\n  ✓ ", style="green")
             empty_text.append("No insider candidates detected\n", style="dim")
-            empty_text.append("    Criteria: $5k+ single trade, ≤5 trades, BUY-only, no crypto\n", style="dim italic")
-            table.add_row(empty_text, "", "", "", "", "", style="dim")
+            empty_text.append("    Criteria: $5k+ single trade, ≤2 trades, No crypto/sports\n", style="dim italic")
+            table.add_row(empty_text, "", "", "")
 
         return Panel(
             table,
             title="[bold magenta]🎯 INSIDER CANDIDATES[/bold magenta]",
-            subtitle="$5k+ single trade | ≤5 trades | BUY-only | No crypto",
+            subtitle="Big Bets | Fresh Wallets | Non-Gambling",
             border_style="magenta",
             box=box.ROUNDED
         )
