@@ -60,8 +60,71 @@ class IntelligenceEngine:
         # Cache for market statistics (rolling averages)
         self.market_stats_cache = {}
         self.market_end_date_cache = {}
+        self.market_question_cache = {}
         self.cache_ttl = 300  # 5 minutes
         self.last_cache_update = {}
+
+        # ============================================================
+        # Market Classification: Filter for Insider-Potential Markets
+        # ============================================================
+        
+        # GAMBLING MARKETS - these are NOT skipped anymore
+        # (kept for reference but not used for filtering)
+        self.gambling_patterns = [
+            'up or down',           # Crypto price gambling
+            'o/u ',                 # Sports over/under
+            'over/under',           # Sports over/under
+            'spread:',              # Sports spreads
+            'highest temperature',  # Weather (random)
+            'earthquakes',          # Natural events (random)
+        ]
+        
+        # HIGH INSIDER POTENTIAL MARKETS - Prioritize these (+15% confidence boost)
+        # These are markets where employees, insiders, or connected people have edge
+        self.insider_keywords = [
+            # Stock/Corporate (employees, executives know)
+            'stock', 'share price', 'ipo', 'earnings', 'quarterly',
+            'merger', 'acquisition', 'buyout', 'takeover',
+            'bankruptcy', 'layoffs', 'restructuring', 'spinoff',
+            'ceo', 'cfo', 'executive', 'board', 'resign', 'fired',
+            'sec', 'insider trading', 'fraud', 'investigation',
+            'dividend', 'stock split', 'buyback',
+            
+            # Product Releases (employees know launch dates)
+            'release', 'launch', 'announce', 'reveal', 'unveil',
+            'model', 'version', 'update', 'ship', 'deliver',
+            'iphone', 'tesla', 'cybertruck', 'nvidia', 'apple',
+            'samsung', 'google', 'pixel', 'microsoft', 'xbox', 'playstation',
+            
+            # AI/Tech Releases (employees know timelines)
+            'gpt', 'openai', 'anthropic', 'claude', 'gemini', 'llama',
+            'ai model', 'chatgpt', 'copilot', 'midjourney', 'sora',
+            'chip', 'h100', 'blackwell', 'processor',
+            
+            # Regulatory/Legal (lawyers, insiders know outcomes)
+            'fda', 'approval', 'trial', 'phase 3', 'drug',
+            'court', 'ruling', 'verdict', 'settlement', 'lawsuit',
+            'antitrust', 'doj', 'ftc', 'regulation',
+            
+            # Politics (staffers, insiders know)
+            'president', 'election', 'congress', 'senate', 'governor',
+            'nomination', 'nominee', 'cabinet', 'veto', 'bill',
+            'impeach', 'indictment', 'conviction', 'pardon',
+            
+            # Geopolitical (diplomats, military know)
+            'iran', 'israel', 'russia', 'ukraine', 'china', 'taiwan',
+            'regime', 'strikes', 'invasion', 'sanctions', 'treaty',
+            'military', 'ceasefire', 'hostage', 'deal',
+            
+            # Entertainment (industry insiders know)
+            'academy award', 'oscar', 'emmy', 'grammy', 'golden globe',
+            'super bowl', 'halftime', 'winner', 'renewal', 'cancelled',
+            'season', 'finale', 'premiere',
+            
+            # Crypto specific (team insiders know)
+            'etf', 'hack', 'exploit', 'airdrop', 'listing',
+            'mainnet', 'testnet', 'fork', 'upgrade',
+        ]
 
     # ============================================================
     # Main Analysis Entry Point
@@ -88,10 +151,13 @@ class IntelligenceEngine:
         if not wallet_address or not condition_id:
             return alerts
 
-        # STEP 0: Check if this is a day trader (skip if so)
-        is_day_trader = await self._is_day_trader(wallet_address)
-        if is_day_trader:
-            return []  # Day traders are noise, not insiders
+        # STEP 0: Check if this wallet is churning this specific market (buy/sell cycles)
+        is_churning = await self._is_churning_market(wallet_address, condition_id)
+        if is_churning:
+            return []  # Skip - this is day trading behavior (repeatedly buy/sell same contract)
+
+        # STEP 1: Classify market for insider boost (don't filter, just boost)
+        market_type, market_question = await self._classify_market(condition_id)
 
         # Get market end date for time-to-resolution weighting
         end_date = await self._get_market_end_date(condition_id)
@@ -99,7 +165,10 @@ class IntelligenceEngine:
         urgency_multiplier = self._calculate_urgency_multiplier(hours_to_resolution)
 
         # Calculate insider boosters for this wallet/trade
+        # Add extra boost for high-insider-potential markets
         insider_boost = await self._calculate_insider_boosters(wallet_address, value_usd)
+        if market_type == 'HIGH_INSIDER':
+            insider_boost += 0.15  # Extra boost for politics/corporate/geopolitical
 
         # Run all detection algorithms concurrently
         results = await asyncio.gather(
@@ -151,7 +220,123 @@ class IntelligenceEngine:
         return alerts
 
     # ============================================================
-    # Day Trader Detection (Filter Out)
+    # Market Classification
+    # ============================================================
+
+    async def _classify_market(self, condition_id: str) -> tuple:
+        """
+        Classify a market as GAMBLING, HIGH_INSIDER, or NORMAL
+        
+        GAMBLING markets (skip these):
+        - Crypto price predictions (up/down, price targets)
+        - Sports spreads and over/unders
+        - Weather predictions
+        - Random outcome gambling
+        
+        HIGH_INSIDER markets (prioritize):
+        - Political events (elections, nominations, resignations)
+        - Geopolitical events (strikes, invasions, treaties)
+        - Corporate events (IPOs, mergers, earnings)
+        
+        Returns:
+            Tuple of (market_type: str, question: str)
+        """
+        # Check cache first
+        if condition_id in self.market_question_cache:
+            question = self.market_question_cache[condition_id]
+        else:
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute("""
+                    SELECT question FROM markets WHERE condition_id = %s
+                """, (condition_id,))
+                result = cursor.fetchone()
+                cursor.close()
+                question = result[0] if result else ''
+                self.market_question_cache[condition_id] = question
+            except Exception:
+                question = ''
+        
+        if not question:
+            return ('NORMAL', '')
+        
+        question_lower = question.lower()
+        
+        # Check if it's a gambling market (skip)
+        for pattern in self.gambling_patterns:
+            if pattern in question_lower:
+                return ('GAMBLING', question)
+        
+        # Check if it's a high-insider-potential market (prioritize)
+        for keyword in self.insider_keywords:
+            if keyword in question_lower:
+                return ('HIGH_INSIDER', question)
+        
+        # Default: normal market
+        return ('NORMAL', question)
+
+    # ============================================================
+    # Churn Detection (Buy/Sell Cycles on Same Contract)
+    # ============================================================
+
+    async def _is_churning_market(self, wallet_address: str, condition_id: str) -> bool:
+        """
+        Check if wallet is churning a specific market (repeatedly buying AND selling)
+        
+        INSIDER pattern (GOOD):
+        - Multiple BUY trades (building position) = OK
+        - Buy then sell once (took profit) = OK
+        - One big conviction bet = OK
+        
+        DAY TRADER pattern (BAD):
+        - Multiple BUY and SELL trades on same contract = BAD
+        - Active back-and-forth trading = BAD
+        
+        Returns True if wallet is churning this market (should skip)
+        """
+        try:
+            cursor = self.db_conn.cursor()
+            
+            # Count buys and sells on this specific market in last 7 days
+            cursor.execute("""
+                SELECT 
+                    SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) as buys,
+                    SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) as sells,
+                    COUNT(DISTINCT DATE(executed_at)) as trading_days
+                FROM trades
+                WHERE 
+                    wallet_address = %s
+                    AND condition_id = %s
+                    AND executed_at >= NOW() - INTERVAL '7 days'
+            """, (wallet_address, condition_id))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if not result:
+                return False
+            
+            buys, sells, trading_days = result
+            buys = buys or 0
+            sells = sells or 0
+            trading_days = trading_days or 0
+            
+            # Churning detection:
+            # If they have BOTH buys AND sells, AND it's happening frequently
+            has_both_sides = buys > 0 and sells > 0
+            is_frequent = (buys + sells) >= 4  # 4+ trades on same market
+            multi_day_trading = trading_days >= 2  # Trading same market on multiple days
+            
+            # Only flag as churning if they're actively going back and forth
+            is_churning = has_both_sides and (is_frequent or multi_day_trading)
+            
+            return is_churning
+            
+        except Exception:
+            return False
+
+    # ============================================================
+    # Day Trader Detection (General - for wallet-level filtering)
     # ============================================================
 
     async def _is_day_trader(self, wallet_address: str) -> bool:
