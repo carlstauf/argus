@@ -140,12 +140,13 @@ class ArgusIngestor:
 
             # Insert trade (with ensure methods inside try block)
             try:
-                # Ensure wallet and market exist
-                self._ensure_wallet_exists(wallet_address, cursor)
-                self._ensure_market_exists(condition_id, cursor)
-
+                # Calculate trade timestamp FIRST
                 timestamp = trade.get('timestamp', int(time.time()))
                 executed_at = datetime.fromtimestamp(timestamp)
+                
+                # Ensure wallet and market exist (pass trade timestamp for accurate first_seen_at)
+                self._ensure_wallet_exists(wallet_address, cursor, executed_at)
+                self._ensure_market_exists(condition_id, cursor)
 
                 size = float(trade.get('size', 0))
                 price = float(trade.get('price', 0))
@@ -204,14 +205,31 @@ class ArgusIngestor:
     # Wallet Management
     # ============================================================
 
-    def _ensure_wallet_exists(self, wallet_address: str, cursor) -> None:
-        """Create wallet record if it doesn't exist"""
+    def _ensure_wallet_exists(self, wallet_address: str, cursor, trade_timestamp: datetime = None) -> None:
+        """
+        Create wallet record if it doesn't exist
+        Uses trade_timestamp as first_seen_at to ensure accurate wallet age
+        """
+        if trade_timestamp is None:
+            trade_timestamp = datetime.now()
+        
+        # Check for existing earliest trade
+        cursor.execute("""
+            SELECT MIN(executed_at) 
+            FROM trades 
+            WHERE wallet_address = %s
+        """, (wallet_address,))
+        
+        result = cursor.fetchone()
+        earliest_trade = result[0] if result and result[0] else trade_timestamp
+        
         cursor.execute("""
             INSERT INTO wallets (address, first_seen_at, last_active_at)
-            VALUES (%s, NOW(), NOW())
+            VALUES (%s, %s, NOW())
             ON CONFLICT (address) DO UPDATE SET
-                last_active_at = NOW()
-        """, (wallet_address,))
+                last_active_at = NOW(),
+                first_seen_at = LEAST(wallets.first_seen_at, EXCLUDED.first_seen_at)
+        """, (wallet_address, earliest_trade))
 
     def _ensure_market_exists(self, condition_id: str, cursor) -> None:
         """Create market record if it doesn't exist"""

@@ -34,6 +34,7 @@ from rich.table import Table
 from rich.live import Live
 from rich.text import Text
 from rich.markup import escape
+from rich.style import Style
 from rich import box
 
 
@@ -200,24 +201,26 @@ class LiveTerminal:
     # ============================================================
 
     @staticmethod
-    def polymarket_market_url(condition_id: str) -> str:
-        """Generate Polymarket market URL"""
-        return f"https://polymarket.com/market/{condition_id}"
+    def polymarket_market_url(condition_id: str, slug: str = None) -> str:
+        """Generate Polymarket market URL - prefers slug, falls back to condition_id"""
+        if slug:
+            # Use slug if available (cleaner URL)
+            return f"https://polymarket.com/event/{slug}"
+        else:
+            # Fall back to condition_id
+            return f"https://polymarket.com/market/{condition_id}"
 
     @staticmethod
-    def etherscan_tx_url(tx_hash: str) -> str:
-        """Generate Etherscan transaction URL"""
-        return f"https://etherscan.io/tx/{tx_hash}"
+    def polymarket_profile_url(address: str) -> str:
+        """Generate Polymarket profile URL for wallet address"""
+        return f"https://polymarket.com/profile/{address}"
 
     @staticmethod
-    def etherscan_address_url(address: str) -> str:
-        """Generate Etherscan address URL"""
-        return f"https://etherscan.io/address/{address}"
-
-    @staticmethod
-    def polyscan_address_url(address: str) -> str:
-        """Generate Polyscan address URL (Polymarket-specific)"""
-        return f"https://polyscan.com/address/{address}"
+    def polymarket_tx_url(tx_hash: str) -> str:
+        """Generate Polymarket transaction URL (if available)"""
+        # Polymarket doesn't have direct TX links, but we can use profile
+        # For now, return empty or use a generic link
+        return f"https://polymarket.com"
 
     def make_clickable_link(self, text: str, url: str, style: str = "cyan") -> Text:
         """Create a clickable link in Rich Text"""
@@ -246,19 +249,39 @@ class LiveTerminal:
         """
         Fetch and ingest new trades from Polymarket
         Returns list of new trades for the live ticker
+        Only processes trades from the last 5 minutes to ensure freshness
         """
         from src.api.polymarket_client import PolymarketClient
+        import time
 
         client = PolymarketClient()
+        
+        # Verify API health before fetching
+        if not client.check_gamma_api_health():
+            # API might be down, skip this cycle
+            return []
+        
         trades = client.get_trades(limit=50)
 
         if not trades:
             return []
 
+        # Sort trades by timestamp descending (newest first)
+        trades.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+
+        # Filter to only very recent trades (last 5 minutes)
+        current_time = time.time()
+        recent_threshold = current_time - 300  # 5 minutes ago
+
         new_trades = []
         cursor = self.db_conn.cursor()
 
         for trade in trades:
+            # Check if trade is recent enough
+            trade_timestamp = trade.get('timestamp', 0)
+            if trade_timestamp < recent_threshold:
+                # Skip old trades - we only want recent data
+                continue
             tx_hash = trade.get('transactionHash')
 
             # Skip if already seen
@@ -268,32 +291,77 @@ class LiveTerminal:
             wallet_address = trade.get('proxyWallet')
             condition_id = trade.get('conditionId')
 
+            # Validate required fields
             if not wallet_address or not condition_id:
+                continue
+            
+            # Validate wallet address format
+            if not wallet_address.startswith('0x') or len(wallet_address) != 42:
+                continue
+            
+            # Validate condition_id format
+            if not condition_id.startswith('0x') or len(condition_id) < 20:
                 continue
 
             try:
-                # Ensure wallet exists (upsert)
-                cursor.execute("""
-                    INSERT INTO wallets (address, first_seen_at, last_active_at)
-                    VALUES (%s, NOW(), NOW())
-                    ON CONFLICT (address) DO UPDATE SET
-                        last_active_at = NOW()
-                """, (wallet_address,))
-
-                # Ensure market exists (upsert)
-                cursor.execute("""
-                    INSERT INTO markets (condition_id, question, status)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (condition_id) DO NOTHING
-                """, (condition_id, trade.get('title', 'Unknown Market'), 'ACTIVE'))
-
-                # Insert trade (upsert)
+                # Calculate trade timestamp FIRST (before wallet operations)
                 timestamp = trade.get('timestamp', int(time.time()))
                 executed_at = datetime.fromtimestamp(timestamp)
+                
+                # Get the wallet's ACTUAL first trade timestamp from existing trades
+                # This ensures freshness_score is based on real wallet age, not when we started tracking
+                cursor.execute("""
+                    SELECT MIN(executed_at) 
+                    FROM trades 
+                    WHERE wallet_address = %s
+                """, (wallet_address,))
+                
+                result = cursor.fetchone()
+                earliest_trade = result[0] if result and result[0] else None
+                
+                # Use the earliest trade timestamp we have, or this trade's timestamp if it's the first
+                if earliest_trade:
+                    # Wallet already has trades - use the earliest one
+                    actual_first_seen = earliest_trade
+                else:
+                    # This is the first trade from this wallet - use this trade's timestamp
+                    actual_first_seen = executed_at
+                
+                # Ensure wallet exists (upsert) - use ACTUAL first trade date, not NOW()
+                # This is critical: first_seen_at should be when wallet FIRST traded, not when we first saw it
+                cursor.execute("""
+                    INSERT INTO wallets (address, first_seen_at, last_active_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (address) DO UPDATE SET
+                        last_active_at = NOW(),
+                        -- Keep the EARLIEST first_seen_at (don't let it get newer)
+                        first_seen_at = LEAST(wallets.first_seen_at, EXCLUDED.first_seen_at)
+                """, (wallet_address, actual_first_seen))
 
+                # Ensure market exists (upsert) - include slug if available
+                slug = trade.get('slug') or trade.get('eventSlug')
+                cursor.execute("""
+                    INSERT INTO markets (condition_id, question, slug, status)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (condition_id) DO UPDATE SET
+                        slug = COALESCE(markets.slug, EXCLUDED.slug)
+                """, (condition_id, trade.get('title', 'Unknown Market'), slug, 'ACTIVE'))
+
+                # Trade timestamp already calculated above
+
+                # Validate and calculate trade values
                 size = float(trade.get('size', 0))
                 price = float(trade.get('price', 0))
+                
+                # Skip invalid trades
+                if size <= 0 or price <= 0 or price > 1:
+                    continue
+                
                 value_usd = size * price
+                
+                # Skip trades with invalid USD values
+                if value_usd <= 0 or value_usd > 10000000:  # Sanity check: max $10M
+                    continue
 
                 cursor.execute("""
                     INSERT INTO trades (
@@ -341,12 +409,25 @@ class LiveTerminal:
                         wallet_address, condition_id, value_usd, timestamp, cursor
                     )
 
-                    # Get market slug if available
-                    cursor.execute("""
-                        SELECT slug FROM markets WHERE condition_id = %s
-                    """, (condition_id,))
-                    market_slug = cursor.fetchone()
-                    slug = market_slug[0] if market_slug and market_slug[0] else None
+                    # Get market slug from trade data (API already provides it!)
+                    slug = trade.get('slug') or trade.get('eventSlug')
+                    
+                    # Validate slug format (should be alphanumeric with hyphens)
+                    if slug and not isinstance(slug, str):
+                        slug = None
+                    elif slug and len(slug) > 200:  # Sanity check
+                        slug = None
+
+                    # Update market with slug if we have it
+                    if slug:
+                        try:
+                            cursor.execute("""
+                                UPDATE markets SET slug = %s
+                                WHERE condition_id = %s AND (slug IS NULL OR slug = '')
+                            """, (slug, condition_id))
+                        except Exception:
+                            # Skip if slug update fails
+                            pass
 
                     # Add to ticker log with full data for links
                     new_trades.append({
@@ -360,7 +441,7 @@ class LiveTerminal:
                         'condition_id': condition_id,
                         'tx_hash': tx_hash,
                         'is_alert': is_alert,
-                        'slug': slug
+                        'slug': slug  # Use slug from API directly!
                     })
 
                     # Update 24h volume
@@ -416,7 +497,14 @@ class LiveTerminal:
     # ============================================================
 
     def get_suspicious_wallets(self, limit: int = 15) -> List[Tuple]:
-        """Get fresh wallets with high volume"""
+        """
+        Get TRULY fresh wallets with high volume
+        Only shows wallets that are ACTUALLY fresh (< 48 hours old based on first trade)
+        
+        CRITICAL: Uses first_seen_at which is set from the earliest trade timestamp we have.
+        If a wallet was created last year but we only started tracking it today, it won't show
+        as fresh because first_seen_at will be today (when we first saw it trade).
+        """
         cursor = self.db_conn.cursor()
 
         cursor.execute("""
@@ -430,8 +518,19 @@ class LiveTerminal:
                 w.win_rate
             FROM wallets w
             WHERE
-                w.freshness_score >= 50
+                -- STRICT: Only show TRULY fresh wallets (< 48 hours old based on ACTUAL first trade)
+                -- This ensures we don't show old wallets that we just started tracking
+                EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 < 48
+                -- Must have freshness_score >= 70 (HIGH or CRITICAL) 
+                AND w.freshness_score >= 70
+                -- Must have significant volume
                 AND w.total_volume_usd > 100
+                -- Data integrity check: Verify first_seen_at matches earliest trade
+                AND EXISTS (
+                    SELECT 1 FROM trades t 
+                    WHERE t.wallet_address = w.address
+                    AND t.executed_at >= w.first_seen_at - INTERVAL '1 hour'
+                )
             ORDER BY w.freshness_score DESC, w.total_volume_usd DESC
             LIMIT %s
         """, (limit,))
@@ -520,7 +619,7 @@ class LiveTerminal:
         text.append("LIVE INTELLIGENCE TERMINAL", style="bold white")
         text.append(" v2.0", style="dim")
 
-        # Status indicators
+        # Status indicators with data freshness
         status_text = Text()
         status_text.append("🟢 LIVE", style="bold green")
         status_text.append(" | ", style="dim")
@@ -529,10 +628,16 @@ class LiveTerminal:
             seconds_ago = (datetime.now() - self.last_ingest_time).seconds
             if seconds_ago < 5:
                 status_text.append(f"Updated {seconds_ago}s ago", style="green")
+                status_text.append(" • ", style="dim")
+                status_text.append("FRESH DATA", style="bold green")
             elif seconds_ago < 15:
                 status_text.append(f"Updated {seconds_ago}s ago", style="yellow")
+                status_text.append(" • ", style="dim")
+                status_text.append("RECENT", style="yellow")
             else:
                 status_text.append(f"Updated {seconds_ago}s ago", style="red")
+                status_text.append(" • ", style="dim")
+                status_text.append("STALE", style="red")
         else:
             status_text.append("Initializing...", style="dim")
         
@@ -607,12 +712,10 @@ class LiveTerminal:
             side_style = "bold green" if trade['side'] == 'BUY' else "bold red"
             side_text = Text(trade['side'], style=side_style)
 
-            # Wallet with link hint
+            # Wallet (not clickable - only market is clickable)
             wallet_text = Text()
             wallet_short = trade['wallet']
             wallet_text.append(wallet_short, style="cyan")
-            if trade.get('wallet_full'):
-                wallet_text.append(" 🔗", style="dim")
 
             # Value with color coding
             value_text = Text()
@@ -625,13 +728,17 @@ class LiveTerminal:
                 value_style = "white"
             value_text.append(f"${value:,.0f}", style=value_style)
 
-            # Market with link
+            # Market with clickable Polymarket link (PRIMARY CLICK TARGET)
             market_text = Text()
             if trade.get('is_alert'):
                 market_text.append("🚨 ", style="bold red")
-            market_text.append(trade['title'][:45], style="white")
             if trade.get('condition_id'):
-                market_text.append(" 🔗", style="dim cyan")
+                market_url = self.polymarket_market_url(trade['condition_id'], trade.get('slug'))
+                # Make market link very prominent - green, bold, underlined
+                link_style = Style(link=market_url, color="bright_green", bold=True, underline=True)
+                market_text.append(trade['title'][:45], style=link_style)
+            else:
+                market_text.append(trade['title'][:45], style="white")
 
             # Row style for alerts
             row_style = "bold red" if trade.get('is_alert') else None
@@ -645,19 +752,21 @@ class LiveTerminal:
                 style=row_style
             )
 
-        # Add footer with link instructions
+        # Add footer with link instructions and data freshness
         footer = Text()
         footer.append("\n💡 ", style="dim")
-        footer.append("Click wallet/market to open in browser", style="dim italic")
-        footer.append(" | ", style="dim")
-        footer.append("Ctrl+Click", style="bold dim")
-        footer.append(" = ", style="dim")
-        footer.append("Etherscan/Polymarket", style="dim cyan")
+        footer.append("Click ", style="dim italic")
+        footer.append("GREEN MARKET NAMES", style="bold bright_green italic")
+        footer.append(" → Opens Polymarket", style="dim italic")
+        footer.append("\n📊 ", style="dim")
+        footer.append("Data: Last 5 minutes only", style="dim italic")
+        footer.append(" • ", style="dim")
+        footer.append("Sorted: Newest first", style="dim italic")
 
         return Panel(
             table,
             title="[bold green]📊 LIVE TICKER[/bold green]",
-            subtitle=f"Last {len(self.trade_log)} trades • Real-time updates",
+            subtitle=f"Last {len(self.trade_log)} trades • Click GREEN market names for Polymarket",
             border_style="green",
             box=box.DOUBLE_EDGE
         )
@@ -682,10 +791,11 @@ class LiveTerminal:
         for wallet in wallets:
             address, age_hours, trades, volume, freshness, pnl, win_rate = wallet[:7]
 
-            # Address with link hint
+            # Address with clickable Polymarket profile link
             address_text = Text()
-            address_text.append(address[:18] + "...", style="cyan")
-            address_text.append(" 🔗", style="dim")
+            wallet_url = self.polymarket_profile_url(address)
+            link_style = Style(link=wallet_url, color="cyan", underline=True)
+            address_text.append(address[:18] + "...", style=link_style)
 
             # Format age
             if age_hours < 1:
@@ -745,7 +855,7 @@ class LiveTerminal:
         return Panel(
             table,
             title="[bold red]🔴 THE PANOPTICON (Fresh Wallets)[/bold red]",
-            subtitle="Auto-refreshes every 5s • Click address for Etherscan",
+            subtitle="Wallets < 48h old • Based on first trade timestamp • Auto-refreshes every 5s",
             border_style="red",
             box=box.DOUBLE_EDGE
         )
@@ -807,12 +917,16 @@ class LiveTerminal:
                 conf_style = "dim"
             conf_text.append(f"{conf_pct}%", style=conf_style)
 
-            # Links column
+            # Links column with clickable links
             links_text = Text()
             if wallet:
-                links_text.append("👤", style="cyan")
+                wallet_url = self.polymarket_profile_url(wallet)
+                link_style = Style(link=wallet_url, color="cyan", underline=True)
+                links_text.append("👤", style=link_style)
             if condition_id:
-                links_text.append(" 📊", style="green")
+                market_url = self.polymarket_market_url(condition_id, slug)
+                link_style = Style(link=market_url, color="green", underline=True)
+                links_text.append(" 📊", style=link_style)
             if not wallet and not condition_id:
                 links_text.append("--", style="dim")
 
@@ -885,7 +999,7 @@ class LiveTerminal:
         return layout
 
     def make_footer(self) -> Panel:
-        """Create footer with URL instructions and recent trade links"""
+        """Create footer with clickable URL links"""
         content = Text()
         content.append("🔗 QUICK LINKS", style="bold cyan")
         content.append(" (Latest Trade)\n", style="dim")
@@ -894,30 +1008,27 @@ class LiveTerminal:
         if self.trade_log:
             latest = list(self.trade_log)[-1]
             
-            if latest.get('tx_hash'):
-                tx_url = self.etherscan_tx_url(latest['tx_hash'])
-                content.append("TX: ", style="dim")
-                # Use Rich's link format for clickable URLs
-                content.append(tx_url, style="cyan underline")
-                content.append("\n", style="dim")
-            
             if latest.get('condition_id'):
-                market_url = self.polymarket_market_url(latest['condition_id'])
+                market_url = self.polymarket_market_url(latest['condition_id'], latest.get('slug'))
                 content.append("Market: ", style="dim")
-                content.append(market_url, style="green underline")
+                link_style = Style(link=market_url, color="green", underline=True)
+                content.append("Click here", style=link_style)
+                content.append(f" ({market_url})", style="dim")
                 content.append("\n", style="dim")
             
             if latest.get('wallet_full'):
-                wallet_url = self.etherscan_address_url(latest['wallet_full'])
-                content.append("Wallet: ", style="dim")
-                content.append(wallet_url, style="yellow underline")
+                wallet_url = self.polymarket_profile_url(latest['wallet_full'])
+                content.append("Profile: ", style="dim")
+                link_style = Style(link=wallet_url, color="cyan", underline=True)
+                content.append("Click here", style=link_style)
+                content.append(f" ({wallet_url})", style="dim")
         else:
             content.append("No trades yet...", style="dim")
         
         content.append("\n\n💡 ", style="dim")
-        content.append("Terminal links are clickable", style="dim italic")
-        content.append(" | ", style="dim")
-        content.append("Copy URLs to browser", style="dim italic")
+        content.append("Click underlined text to open", style="dim italic")
+        content.append("\n", style="dim")
+        content.append("   Full URLs shown for copying", style="dim italic")
 
         return Panel(
             content,
@@ -928,13 +1039,11 @@ class LiveTerminal:
 
     def print_urls_for_trade(self, trade: Dict):
         """Print URLs for a trade (helper for debugging/access)"""
-        if trade.get('tx_hash'):
-            self.console.print(f"\n[cyan]Transaction:[/cyan] {self.etherscan_tx_url(trade['tx_hash'])}")
-        if trade.get('wallet_full'):
-            self.console.print(f"[cyan]Wallet (Etherscan):[/cyan] {self.etherscan_address_url(trade['wallet_full'])}")
-            self.console.print(f"[cyan]Wallet (Polyscan):[/cyan] {self.polyscan_address_url(trade['wallet_full'])}")
         if trade.get('condition_id'):
-            self.console.print(f"[cyan]Market:[/cyan] {self.polymarket_market_url(trade['condition_id'])}")
+            market_url = self.polymarket_market_url(trade['condition_id'], trade.get('slug'))
+            self.console.print(f"\n[green]Market:[/green] {market_url}")
+        if trade.get('wallet_full'):
+            self.console.print(f"[cyan]Profile:[/cyan] {self.polymarket_profile_url(trade['wallet_full'])}")
 
     # ============================================================
     # Main Live Loop
@@ -947,8 +1056,9 @@ class LiveTerminal:
         self.console.print("[dim]Ingesting data every 2 seconds...[/dim]")
         self.console.print("[dim]Dashboard refreshes every 5 seconds...[/dim]")
         self.console.print("[dim]Press Ctrl+C to exit[/dim]\n")
-        self.console.print("[bold yellow]💡 TIP:[/bold yellow] URLs are shown with 🔗 icons")
-        self.console.print("[dim]   Copy URLs from terminal or use terminal's link support[/dim]\n")
+        self.console.print("[bold yellow]💡 TIP:[/bold yellow] Links are clickable in supported terminals")
+        self.console.print("[dim]   Compatible: iTerm2, Windows Terminal, GNOME Terminal, Alacritty[/dim]")
+        self.console.print("[dim]   If links don't work, copy URLs from the footer panel[/dim]\n")
 
         time.sleep(2)
 

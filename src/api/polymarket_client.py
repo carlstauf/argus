@@ -35,6 +35,17 @@ class PolymarketClient:
         except requests.exceptions.RequestException as e:
             print(f"Error making request to {url}: {e}")
             return None
+    
+    def check_gamma_api_health(self) -> bool:
+        """
+        Check Gamma API health status
+        Docs: https://docs.polymarket.com/api-reference/gamma-status/gamma-api-health-check
+        """
+        try:
+            response = self.session.get(f"{self.gamma_api}/status", timeout=5)
+            return response.status_code == 200 and response.text.strip() == "OK"
+        except:
+            return False
 
     # ============================================================
     # GAMMA API - Market Data
@@ -45,18 +56,39 @@ class PolymarketClient:
         limit: int = 100,
         offset: int = 0,
         active: bool = True,
-        closed: bool = False
+        closed: bool = False,
+        order: str = 'id',
+        ascending: bool = False,
+        tag_id: Optional[int] = None
     ) -> List[Dict]:
         """
         Fetch markets from Gamma API
+        Following Polymarket docs: https://docs.polymarket.com/gamma-structure/fetching-markets
+        
+        Args:
+            limit: Number of results (default 100)
+            offset: Pagination offset (default 0)
+            active: Filter active markets (default True)
+            closed: Include closed markets (default False) - set to False for active only
+            order: Order field (default 'id')
+            ascending: Sort order (default False = newest first)
+            tag_id: Filter by tag ID (optional)
         """
         url = f"{self.gamma_api}/markets"
         params = {
             'limit': limit,
             'offset': offset,
-            'active': active,
-            'closed': closed
+            'closed': str(closed).lower()  # Docs recommend closed=false for active markets
         }
+        
+        if active:
+            params['active'] = str(active).lower()
+        if order:
+            params['order'] = order
+        if ascending is not None:
+            params['ascending'] = str(ascending).lower()
+        if tag_id:
+            params['tag_id'] = tag_id
 
         data = self._make_request(url, params)
         return data if data else []
@@ -65,25 +97,65 @@ class PolymarketClient:
         """Get a specific market by condition ID"""
         url = f"{self.gamma_api}/markets/{condition_id}"
         return self._make_request(url)
+    
+    def get_market_by_slug(self, slug: str) -> Optional[Dict]:
+        """
+        Get a specific market by slug (recommended method per docs)
+        Docs: https://docs.polymarket.com/gamma-structure/fetching-markets#1-fetch-by-slug
+        """
+        url = f"{self.gamma_api}/markets/slug/{slug}"
+        return self._make_request(url)
 
     def get_events(
         self,
         limit: int = 100,
         offset: int = 0,
-        active: bool = True
+        active: bool = True,
+        closed: bool = False,
+        order: str = 'id',
+        ascending: bool = False,
+        tag_id: Optional[int] = None
     ) -> List[Dict]:
         """
         Fetch events (groups of markets) from Gamma API
+        Following Polymarket docs: https://docs.polymarket.com/gamma-structure/fetching-markets
+        Recommended for fetching all active markets efficiently.
+        
+        Args:
+            limit: Number of results (default 100)
+            offset: Pagination offset (default 0)
+            active: Filter active events (default True)
+            closed: Include closed events (default False) - set to False for active only
+            order: Order field (default 'id')
+            ascending: Sort order (default False = newest first)
+            tag_id: Filter by tag ID (optional)
         """
         url = f"{self.gamma_api}/events"
         params = {
             'limit': limit,
             'offset': offset,
-            'active': active
+            'closed': str(closed).lower()  # Docs recommend closed=false for active markets
         }
+        
+        if active:
+            params['active'] = str(active).lower()
+        if order:
+            params['order'] = order
+        if ascending is not None:
+            params['ascending'] = str(ascending).lower()
+        if tag_id:
+            params['tag_id'] = tag_id
 
         data = self._make_request(url, params)
         return data if data else []
+    
+    def get_event_by_slug(self, slug: str) -> Optional[Dict]:
+        """
+        Get a specific event by slug (recommended method per docs)
+        Docs: https://docs.polymarket.com/gamma-structure/fetching-markets#1-fetch-by-slug
+        """
+        url = f"{self.gamma_api}/events/slug/{slug}"
+        return self._make_request(url)
 
     # ============================================================
     # DATA API - Trades & Positions
@@ -98,6 +170,7 @@ class PolymarketClient:
     ) -> List[Dict]:
         """
         Fetch trades from Data API
+        Returns trades sorted by timestamp descending (newest first)
 
         Args:
             market: Condition ID to filter by
@@ -116,6 +189,11 @@ class PolymarketClient:
             params['side'] = side
 
         data = self._make_request(url, params)
+        
+        if data:
+            # Sort by timestamp descending to ensure newest trades first
+            data.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+        
         return data if data else []
 
     def get_positions(
@@ -192,26 +270,40 @@ class PolymarketClient:
     def get_all_active_markets(self) -> List[Dict]:
         """
         Fetch ALL active markets by paginating through results
+        Following Polymarket best practices: use events endpoint for efficiency
+        Docs: https://docs.polymarket.com/gamma-structure/fetching-markets#3-fetch-all-active-markets
         """
         all_markets = []
         offset = 0
         batch_size = 100
 
         while True:
-            batch = self.get_markets(limit=batch_size, offset=offset, active=True)
+            # Use events endpoint as recommended by docs (more efficient)
+            batch = self.get_events(
+                limit=batch_size,
+                offset=offset,
+                active=True,
+                closed=False,
+                order='id',
+                ascending=False  # Newest first
+            )
 
             if not batch:
                 break
 
-            all_markets.extend(batch)
+            # Extract markets from events
+            for event in batch:
+                markets = event.get('markets', [])
+                all_markets.extend(markets)
+
             offset += batch_size
 
-            # Rate limiting
+            # Rate limiting (respect API limits)
             time.sleep(0.1)
 
-            # Safety check (increased to 50k)
+            # Safety check
             if offset > 50000:
-                print("Warning: Hit safety limit of 50,000 markets")
+                print("Warning: Hit safety limit of 50,000 events")
                 break
 
         return all_markets
