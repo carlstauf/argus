@@ -498,33 +498,38 @@ class LiveTerminal:
 
     def get_suspicious_wallets(self, limit: int = 15) -> List[Tuple]:
         """
-        Get TRULY fresh wallets with high volume - targeting TRUE INSIDERS
+        Get HIGH-QUALITY insider candidates only - VERY strict filtering
         
-        Filters out:
-        - Day traders (wallets with BOTH buy AND sell trades = trading, not conviction)
-        - Crypto gamblers (wallets trading bitcoin, ethereum, up or down markets)
-        - Old wallets we just started tracking (API verified)
+        Quality filters:
+        - Volume >= $5,000 (serious bets only)
+        - BUY-ONLY wallets (no selling = true conviction)
+        - Max 3 unique markets (focused, not scattered)
+        - No crypto/gambling markets (no insider edge)
+        - Fresh wallets only (< 48h)
         
-        True insiders make ONE-DIRECTIONAL bets on INSIDER markets, not crypto gambling.
+        True insiders: Make BIG, ONE-DIRECTIONAL bets on FEW markets with insider info.
         """
         from src.api.polymarket_client import PolymarketClient
         
         cursor = self.db_conn.cursor()
 
-        # Get candidate wallets from DB with day trader and crypto gambler filtering
+        # STRICT quality filtering - only the best candidates
         cursor.execute("""
-            WITH day_traders AS (
-                -- Wallets with BOTH buy AND sell trades = day traders, not conviction bettors
-                SELECT wallet_address
+            WITH wallet_stats AS (
+                -- Calculate wallet trading patterns
+                SELECT 
+                    wallet_address,
+                    COUNT(*) as total_trades,
+                    COUNT(DISTINCT condition_id) as unique_markets,
+                    SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) as buy_count,
+                    SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) as sell_count,
+                    SUM(value_usd) as total_volume
                 FROM trades
                 WHERE executed_at >= NOW() - INTERVAL '7 days'
                 GROUP BY wallet_address
-                HAVING 
-                    COUNT(CASE WHEN side = 'BUY' THEN 1 END) > 0 
-                    AND COUNT(CASE WHEN side = 'SELL' THEN 1 END) > 0
             ),
             crypto_gamblers AS (
-                -- Wallets trading crypto/gambling markets (no insider edge)
+                -- Exclude wallets trading ANY crypto/gambling markets
                 SELECT DISTINCT t.wallet_address
                 FROM trades t
                 JOIN markets m ON t.condition_id = m.condition_id
@@ -544,7 +549,23 @@ class LiveTerminal:
                         OR LOWER(m.question) LIKE '%%price above%%'
                         OR LOWER(m.question) LIKE '%%price below%%'
                         OR LOWER(m.question) LIKE '%%fdv%%'
+                        OR LOWER(m.question) LIKE '%%market cap%%'
+                        OR LOWER(m.question) LIKE '%%token%%'
                     )
+            ),
+            quality_wallets AS (
+                -- Only wallets that pass ALL quality checks
+                SELECT ws.wallet_address
+                FROM wallet_stats ws
+                WHERE
+                    -- BUY-ONLY: No sells at all = true conviction
+                    ws.sell_count = 0
+                    -- Focused: Max 3 markets = not a gambler
+                    AND ws.unique_markets <= 3
+                    -- Significant: At least $5,000 volume
+                    AND ws.total_volume >= 5000
+                    -- Not a crypto gambler
+                    AND ws.wallet_address NOT IN (SELECT wallet_address FROM crypto_gamblers)
             )
             SELECT
                 w.address,
@@ -556,21 +577,15 @@ class LiveTerminal:
                 w.win_rate
             FROM wallets w
             WHERE
-                -- Initial filter: DB says < 48 hours
+                -- Fresh: < 48 hours old
                 EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 < 48
-                -- Must have freshness_score >= 70 (HIGH or CRITICAL) 
+                -- High freshness score
                 AND w.freshness_score >= 70
-                -- Must have significant volume
-                AND w.total_volume_usd > 100
-                -- EXCLUDE day traders (have both buy and sell)
-                AND w.address NOT IN (SELECT wallet_address FROM day_traders)
-                -- EXCLUDE crypto gamblers
-                AND w.address NOT IN (SELECT wallet_address FROM crypto_gamblers)
-                -- EXCLUDE flagged day traders
-                AND (w.is_day_trader IS NULL OR w.is_day_trader = FALSE)
-            ORDER BY w.freshness_score DESC, w.total_volume_usd DESC
+                -- MUST pass quality checks
+                AND w.address IN (SELECT wallet_address FROM quality_wallets)
+            ORDER BY w.total_volume_usd DESC, w.freshness_score DESC
             LIMIT %s
-        """, (limit * 3,))  # Get more candidates since we'll filter some out
+        """, (limit * 2,))
 
         candidates = cursor.fetchall()
         cursor.close()
@@ -704,45 +719,36 @@ class LiveTerminal:
     # ============================================================
 
     def make_header(self) -> Panel:
-        """Create enhanced header panel"""
+        """Create clean minimal header"""
         text = Text()
-        text.append("ARGUS ", style="bold cyan")
-        text.append("👁️ ", style="bold white")
-        text.append("LIVE INTELLIGENCE TERMINAL", style="bold white")
-        text.append(" v2.0", style="dim")
+        text.append("A R G U S", style="bold bright_white")
+        text.append("  ", style="dim")
+        text.append("◉", style="bold magenta")
+        text.append("  ", style="dim")
+        text.append("Insider Intelligence", style="italic dim")
 
-        # Status indicators with data freshness
+        # Minimal status
         status_text = Text()
-        status_text.append("🟢 LIVE", style="bold green")
-        status_text.append(" | ", style="dim")
         
         if self.last_ingest_time:
             seconds_ago = (datetime.now() - self.last_ingest_time).seconds
-            if seconds_ago < 5:
-                status_text.append(f"Updated {seconds_ago}s ago", style="green")
-                status_text.append(" • ", style="dim")
-                status_text.append("FRESH DATA", style="bold green")
-            elif seconds_ago < 15:
-                status_text.append(f"Updated {seconds_ago}s ago", style="yellow")
-                status_text.append(" • ", style="dim")
-                status_text.append("RECENT", style="yellow")
+            if seconds_ago < 10:
+                status_text.append("● LIVE", style="bold green")
             else:
-                status_text.append(f"Updated {seconds_ago}s ago", style="red")
-                status_text.append(" • ", style="dim")
-                status_text.append("STALE", style="red")
+                status_text.append("○ SYNC", style="yellow")
         else:
-            status_text.append("Initializing...", style="dim")
+            status_text.append("○ INIT", style="dim")
         
-        status_text.append(" | ", style="dim")
-        status_text.append(f"{datetime.now().strftime('%H:%M:%S')}", style="cyan")
+        status_text.append("  ", style="dim")
+        status_text.append(f"{datetime.now().strftime('%H:%M:%S')}", style="dim")
 
         subtitle = str(status_text)
 
         return Panel(
             text,
-            style="bold cyan",
+            style="dim",
             subtitle=subtitle,
-            box=box.DOUBLE_EDGE
+            box=box.ROUNDED
         )
 
     def make_stats_panel(self, stats: Dict) -> Panel:
@@ -775,9 +781,9 @@ class LiveTerminal:
 
         return Panel(
             content,
-            title="[bold cyan]📈 SYSTEM STATS[/bold cyan]",
-            border_style="cyan",
-            box=box.DOUBLE_EDGE
+            title="[dim]STATS[/dim]",
+            border_style="dim",
+            box=box.ROUNDED
         )
 
     def make_ticker(self) -> Panel:
@@ -857,10 +863,10 @@ class LiveTerminal:
 
         return Panel(
             table,
-            title="[bold green]📊 LIVE TICKER[/bold green]",
-            subtitle=f"Last {len(self.trade_log)} trades • Click GREEN market names for Polymarket",
-            border_style="green",
-            box=box.DOUBLE_EDGE
+            title="[bold white]FEED[/bold white]",
+            subtitle=f"{len(self.trade_log)} trades",
+            border_style="dim",
+            box=box.ROUNDED
         )
 
     def make_panopticon(self, wallets: List[Tuple]) -> Panel:
@@ -942,14 +948,19 @@ class LiveTerminal:
             )
 
         if not wallets:
-            table.add_row("No suspicious activity detected", "", "", "", "", "", style="dim")
+            # Better empty state
+            empty_text = Text()
+            empty_text.append("\n  ✓ ", style="green")
+            empty_text.append("No insider candidates detected\n", style="dim")
+            empty_text.append("    Criteria: $5k+ volume, BUY-only, ≤3 markets, no crypto\n", style="dim italic")
+            table.add_row(empty_text, "", "", "", "", "", style="dim")
 
         return Panel(
             table,
-            title="[bold red]🔴 THE PANOPTICON (Fresh Wallets)[/bold red]",
-            subtitle="Wallets < 48h old • Based on first trade timestamp • Auto-refreshes every 5s",
-            border_style="red",
-            box=box.DOUBLE_EDGE
+            title="[bold magenta]🎯 INSIDER CANDIDATES[/bold magenta]",
+            subtitle="$5k+ | BUY-only | ≤3 markets | No crypto gambling",
+            border_style="magenta",
+            box=box.ROUNDED
         )
 
     def make_alerts_panel(self, alerts: List[Tuple]) -> Panel:
@@ -1040,10 +1051,10 @@ class LiveTerminal:
 
         return Panel(
             table,
-            title="[bold yellow]🚨 INTELLIGENCE ALERTS[/bold yellow]",
-            subtitle=f"Last {len(alerts)} alerts • Click icons for links",
+            title="[bold yellow]SIGNALS[/bold yellow]",
+            subtitle=f"{len(alerts)} alerts",
             border_style="yellow",
-            box=box.DOUBLE_EDGE
+            box=box.ROUNDED
         )
 
     def make_layout(self) -> Layout:
