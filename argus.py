@@ -174,6 +174,10 @@ class LiveTerminal:
         self.console = Console()
         self.db_conn = self._connect_db()
 
+        # Initialize Intelligence Engine
+        from src.intelligence.engine import IntelligenceEngine
+        self.intelligence = IntelligenceEngine(self.db_conn)
+
         # Trade log (last 50 trades)
         self.trade_log = deque(maxlen=50)
 
@@ -203,7 +207,7 @@ class LiveTerminal:
     # Real-Time Ingestion (Every 2 seconds)
     # ============================================================
 
-    def ingest_live_data(self) -> List[Dict]:
+    async def ingest_live_data(self) -> List[Dict]:
         """
         Fetch and ingest new trades from Polymarket
         Returns list of new trades for the live ticker
@@ -294,9 +298,12 @@ class LiveTerminal:
                         WHERE address = %s
                     """, (value_usd, wallet_address))
 
-                    # Check for alerts
-                    is_alert = self._check_trade_alert(
-                        wallet_address, condition_id, value_usd, cursor
+                    # Commit before running intelligence analysis
+                    self.db_conn.commit()
+
+                    # Run Intelligence Engine analysis
+                    is_alert = await self._run_intelligence_analysis(
+                        wallet_address, condition_id, value_usd, timestamp, cursor
                     )
 
                     # Add to ticker log
@@ -322,45 +329,38 @@ class LiveTerminal:
         self.last_ingest_time = datetime.now()
         return new_trades
 
-    def _check_trade_alert(
-        self, wallet_address: str, condition_id: str, value_usd: float, cursor
+    async def _run_intelligence_analysis(
+        self, wallet_address: str, condition_id: str, value_usd: float, timestamp: int, cursor
     ) -> bool:
-        """Check if trade triggers an alert. Returns True if alert created."""
+        """
+        Run Intelligence Engine analysis on a trade
+        Returns True if any alert was triggered
+        """
 
-        # Get wallet age
-        cursor.execute("""
-            SELECT EXTRACT(EPOCH FROM (NOW() - first_seen_at)) / 3600 as age_hours
-            FROM wallets WHERE address = %s
-        """, (wallet_address,))
+        # Prepare trade dict for analysis
+        trade_data = {
+            'wallet_address': wallet_address,
+            'condition_id': condition_id,
+            'value_usd': value_usd,
+            'timestamp': timestamp
+        }
 
-        result = cursor.fetchone()
-        wallet_age_hours = result[0] if result else 999999
+        try:
+            # Run all detection algorithms
+            alerts = await self.intelligence.analyze(trade_data)
 
-        # CRITICAL: Fresh wallet + large bet
-        if wallet_age_hours < self.fresh_wallet_hours and value_usd > self.whale_threshold_usd:
-            cursor.execute("""
-                INSERT INTO alerts (
-                    alert_type, severity, wallet_address, condition_id,
-                    title, description, confidence_score, supporting_data
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                'FRESH_WALLET',
-                'CRITICAL',
-                wallet_address,
-                condition_id,
-                f'🚨 INSIDER SIGNAL: ${value_usd:,.0f} from {wallet_age_hours:.1f}h old wallet',
-                f'Fresh wallet {wallet_address[:10]}... placed ${value_usd:,.0f} bet',
-                0.85,
-                psycopg2.extras.Json({
-                    'wallet_age_hours': wallet_age_hours,
-                    'trade_value_usd': value_usd
-                })
-            ))
+            # Save alerts to database
+            alert_triggered = False
+            for alert in alerts:
+                if self.intelligence.save_alert(alert):
+                    self.alerts_generated += 1
+                    alert_triggered = True
 
-            self.alerts_generated += 1
-            return True
+            return alert_triggered
 
-        return False
+        except Exception as e:
+            # Silent fail
+            return False
 
     # ============================================================
     # Data Fetchers for Dashboard
@@ -389,18 +389,19 @@ class LiveTerminal:
         cursor.close()
         return results
 
-    def get_recent_alerts(self, limit: int = 10) -> List[Tuple]:
-        """Get recent CRITICAL alerts"""
+    def get_recent_alerts(self, limit: int = 15) -> List[Tuple]:
+        """Get recent CRITICAL and HIGH alerts"""
         cursor = self.db_conn.cursor()
 
         cursor.execute("""
             SELECT
+                a.alert_type,
                 a.severity,
                 a.title,
                 a.created_at,
                 a.confidence_score
             FROM alerts a
-            WHERE a.severity IN ('CRITICAL', 'HIGH')
+            WHERE a.severity IN ('CRITICAL', 'HIGH', 'MEDIUM')
             ORDER BY a.created_at DESC
             LIMIT %s
         """, (limit,))
@@ -570,36 +571,56 @@ class LiveTerminal:
         )
 
     def make_alerts_panel(self, alerts: List[Tuple]) -> Panel:
-        """Create alerts panel"""
+        """Create alerts panel with alert type icons"""
         table = Table(
             show_header=True,
             header_style="bold yellow",
             box=box.SIMPLE,
-            expand=True
+            expand=True,
+            show_lines=False
         )
 
-        table.add_column("Sev", width=8)
+        table.add_column("Type", width=6)
         table.add_column("Alert", style="white")
-        table.add_column("Conf", width=6, justify="right")
+        table.add_column("Conf", width=5, justify="right")
+
+        # Alert type icons
+        alert_icons = {
+            'CRITICAL_FRESH': '🔴',
+            'SUSPICIOUS_STRUCTURING': '🔨',
+            'WHALE_ANOMALY': '📊',
+            'WHALE_MOVE': '🐋',
+            'FRESH_WALLET': '🔴'
+        }
 
         for alert in alerts:
-            severity, title, created_at, confidence = alert
+            alert_type, severity, title, created_at, confidence = alert
 
-            sev_style = "bold red" if severity == 'CRITICAL' else "bold yellow"
+            # Get icon
+            icon = alert_icons.get(alert_type, '⚠️')
+
+            # Color by severity
+            if severity == 'CRITICAL':
+                sev_style = "bold red"
+            elif severity == 'HIGH':
+                sev_style = "bold yellow"
+            else:
+                sev_style = "bold blue"
 
             table.add_row(
-                severity,
-                title[:60],
+                icon,
+                title[:55],
                 f"{confidence*100:.0f}%",
                 style=sev_style
             )
 
         if not alerts:
-            table.add_row("", "No critical alerts", "", style="dim")
+            table.add_row("", "No alerts detected", "", style="dim")
 
         return Panel(
             table,
-            title="[bold yellow]🚨 RECENT ALERTS[/bold yellow]",
+            title="[bold yellow]🚨 INTELLIGENCE ALERTS[/bold yellow]",
+            subtitle=f"Last {len(alerts)} alerts",
             border_style="yellow",
             box=box.ROUNDED
         )
@@ -678,7 +699,7 @@ class LiveTerminal:
 
                 while True:
                     # Ingest new trades every 2 seconds
-                    new_trades = self.ingest_live_data()
+                    new_trades = await self.ingest_live_data()
 
                     # Add to ticker log
                     for trade in new_trades:

@@ -138,12 +138,12 @@ class ArgusIngestor:
             if not wallet_address or not condition_id:
                 continue
 
-            # Ensure wallet and market exist
-            self._ensure_wallet_exists(wallet_address, cursor)
-            self._ensure_market_exists(condition_id, cursor)
-
-            # Insert trade
+            # Insert trade (with ensure methods inside try block)
             try:
+                # Ensure wallet and market exist
+                self._ensure_wallet_exists(wallet_address, cursor)
+                self._ensure_market_exists(condition_id, cursor)
+
                 timestamp = trade.get('timestamp', int(time.time()))
                 executed_at = datetime.fromtimestamp(timestamp)
 
@@ -189,8 +189,9 @@ class ArgusIngestor:
                     )
 
             except Exception as e:
-                print(f"[INGESTOR] Error inserting trade {tx_hash}: {e}")
+                # Rollback on any error to reset transaction
                 self.db_conn.rollback()
+                # Silent continue (don't spam console)
                 continue
 
         self.db_conn.commit()
