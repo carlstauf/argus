@@ -498,153 +498,103 @@ class LiveTerminal:
 
     def get_suspicious_wallets(self, limit: int = 15) -> List[Tuple]:
         """
-        Get HIGH-QUALITY insider candidates only - VERY strict filtering
+        Get TRUE INSIDER candidates - ULTRA STRICT
         
-        Quality filters:
-        - Volume >= $5,000 (serious bets only)
-        - BUY-ONLY wallets (no selling = true conviction)
-        - Max 3 unique markets (focused, not scattered)
-        - No crypto/gambling markets (no insider edge)
-        - Fresh wallets only (< 48h)
+        REAL INSIDER CRITERIA:
+        - EXACTLY 1-2 trades total (not a day trader)
+        - Single trade >= $10,000 (serious conviction)
+        - Fresh wallet (< 48h old)
+        - NOT sports betting (vs., o/u, spread)
+        - NOT crypto gambling (up or down, price above/below)
         
-        True insiders: Make BIG, ONE-DIRECTIONAL bets on FEW markets with insider info.
+        This is it. No exceptions. One big conviction bet = insider.
         """
         from src.api.polymarket_client import PolymarketClient
         
         cursor = self.db_conn.cursor()
 
-        # STRICT quality filtering - only the best candidates
+        # ULTRA STRICT: Only wallets with 1-2 trades, one being $10k+
         cursor.execute("""
-            WITH wallet_stats AS (
-                -- Calculate wallet trading patterns
+            WITH recent_trades AS (
+                SELECT 
+                    t.wallet_address,
+                    t.value_usd,
+                    t.side,
+                    t.condition_id,
+                    t.executed_at,
+                    m.question
+                FROM trades t
+                LEFT JOIN markets m ON t.condition_id = m.condition_id
+                WHERE t.executed_at >= NOW() - INTERVAL '48 hours'
+            ),
+            wallet_activity AS (
                 SELECT 
                     wallet_address,
-                    COUNT(*) as total_trades,
-                    COUNT(DISTINCT condition_id) as unique_markets,
-                    SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) as buy_count,
-                    SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END) as sell_count,
-                    SUM(value_usd) as total_volume
-                FROM trades
-                WHERE executed_at >= NOW() - INTERVAL '7 days'
+                    COUNT(*) as trade_count,
+                    MAX(value_usd) as biggest_trade,
+                    SUM(value_usd) as total_volume,
+                    MIN(executed_at) as first_trade,
+                    -- Check if ANY trade is on gambling markets
+                    BOOL_OR(
+                        LOWER(question) LIKE '%%vs.%%' OR
+                        LOWER(question) LIKE '%%vs %%' OR
+                        LOWER(question) LIKE '%%o/u%%' OR
+                        LOWER(question) LIKE '%%spread%%' OR
+                        LOWER(question) LIKE '%%over/under%%' OR
+                        LOWER(question) LIKE '%%up or down%%' OR
+                        LOWER(question) LIKE '%%bitcoin%%' OR
+                        LOWER(question) LIKE '%%btc%%' OR
+                        LOWER(question) LIKE '%%ethereum%%' OR
+                        LOWER(question) LIKE '%%solana%%' OR
+                        LOWER(question) LIKE '%%xrp%%' OR
+                        LOWER(question) LIKE '%%price above%%' OR
+                        LOWER(question) LIKE '%%price below%%'
+                    ) as is_gambler
+                FROM recent_trades
                 GROUP BY wallet_address
-            ),
-            crypto_gamblers AS (
-                -- Exclude wallets trading ANY crypto/gambling markets
-                SELECT DISTINCT t.wallet_address
-                FROM trades t
-                JOIN markets m ON t.condition_id = m.condition_id
-                WHERE 
-                    t.executed_at >= NOW() - INTERVAL '7 days'
-                    AND (
-                        LOWER(m.question) LIKE '%%bitcoin%%'
-                        OR LOWER(m.question) LIKE '%%btc%%'
-                        OR LOWER(m.question) LIKE '%%ethereum%%'
-                        OR LOWER(m.question) LIKE '%%eth %%'
-                        OR LOWER(m.question) LIKE '%%crypto%%'
-                        OR LOWER(m.question) LIKE '%%up or down%%'
-                        OR LOWER(m.question) LIKE '%%xrp%%'
-                        OR LOWER(m.question) LIKE '%%solana%%'
-                        OR LOWER(m.question) LIKE '%%sol %%'
-                        OR LOWER(m.question) LIKE '%%doge%%'
-                        OR LOWER(m.question) LIKE '%%price above%%'
-                        OR LOWER(m.question) LIKE '%%price below%%'
-                        OR LOWER(m.question) LIKE '%%fdv%%'
-                        OR LOWER(m.question) LIKE '%%market cap%%'
-                        OR LOWER(m.question) LIKE '%%token%%'
-                    )
-            ),
-            quality_wallets AS (
-                -- Only wallets that pass ALL quality checks
-                SELECT ws.wallet_address
-                FROM wallet_stats ws
-                WHERE
-                    -- BUY-ONLY: No sells at all = true conviction
-                    ws.sell_count = 0
-                    -- Focused: Max 3 markets = not a gambler
-                    AND ws.unique_markets <= 3
-                    -- Significant: At least $5,000 volume
-                    AND ws.total_volume >= 5000
-                    -- Not a crypto gambler
-                    AND ws.wallet_address NOT IN (SELECT wallet_address FROM crypto_gamblers)
             )
-            SELECT
-                w.address,
-                EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 as db_age_hours,
-                w.total_trades,
-                w.total_volume_usd,
-                w.freshness_score,
-                w.total_pnl_usd,
-                w.win_rate
-            FROM wallets w
-            WHERE
-                -- Fresh: < 48 hours old
-                EXTRACT(EPOCH FROM (NOW() - w.first_seen_at)) / 3600 < 48
-                -- High freshness score
-                AND w.freshness_score >= 70
-                -- MUST pass quality checks
-                AND w.address IN (SELECT wallet_address FROM quality_wallets)
-            ORDER BY w.total_volume_usd DESC, w.freshness_score DESC
+            SELECT 
+                wa.wallet_address,
+                EXTRACT(EPOCH FROM (NOW() - wa.first_trade)) / 3600 as age_hours,
+                wa.trade_count,
+                wa.total_volume,
+                100 as freshness_score,  -- All are fresh by definition
+                0 as pnl,
+                0 as win_rate
+            FROM wallet_activity wa
+            WHERE 
+                -- EXACTLY 1-2 trades (not a day trader)
+                wa.trade_count <= 2
+                -- BIG SINGLE BET: At least $10k on one trade
+                AND wa.biggest_trade >= 10000
+                -- NOT gambling on sports/crypto
+                AND wa.is_gambler = FALSE
+            ORDER BY wa.biggest_trade DESC
             LIMIT %s
-        """, (limit * 2,))
+        """, (limit,))
 
         candidates = cursor.fetchall()
         cursor.close()
         
-        # Verify each wallet's age via API
+        # Verify via API that these are truly fresh wallets
         client = PolymarketClient()
         verified_wallets = []
         
         for wallet_data in candidates:
             address = wallet_data[0]
-            db_age_hours = wallet_data[1]
             
             try:
-                # Check true wallet age via API
-                is_fresh, api_age_hours = client.is_wallet_truly_fresh(address, max_age_hours=48)
-                
+                is_fresh, api_age = client.is_wallet_truly_fresh(address, max_age_hours=72)
                 if is_fresh:
-                    # Use API age if available, otherwise DB age
-                    actual_age = api_age_hours if api_age_hours > 0 else db_age_hours
-                    
-                    # Rebuild tuple with correct age
-                    verified_wallet = (
-                        wallet_data[0],  # address
-                        actual_age,      # age_hours (API-verified)
-                        wallet_data[2],  # total_trades
-                        wallet_data[3],  # total_volume_usd
-                        wallet_data[4],  # freshness_score
-                        wallet_data[5],  # total_pnl_usd
-                        wallet_data[6],  # win_rate
-                    )
-                    verified_wallets.append(verified_wallet)
-                else:
-                    # This wallet is NOT actually fresh - update DB to fix it
-                    first_ts = client.get_wallet_first_trade_timestamp(address)
-                    if first_ts:
-                        from datetime import datetime
-                        first_dt = datetime.fromtimestamp(first_ts)
-                        try:
-                            update_cursor = self.db_conn.cursor()
-                            update_cursor.execute("""
-                                UPDATE wallets 
-                                SET first_seen_at = %s,
-                                    freshness_score = 0
-                                WHERE address = %s
-                            """, (first_dt, address))
-                            self.db_conn.commit()
-                            update_cursor.close()
-                        except Exception:
-                            pass
-                            
+                    verified_wallets.append(wallet_data)
             except Exception:
-                # If API check fails, include wallet with DB data
+                # If API fails, include with DB data
                 verified_wallets.append(wallet_data)
             
-            # Stop once we have enough verified wallets
             if len(verified_wallets) >= limit:
                 break
         
-        return verified_wallets[:limit]
+        return verified_wallets
 
     def get_recent_alerts(self, limit: int = 15) -> List[Tuple]:
         """Get recent CRITICAL and HIGH alerts"""
@@ -952,13 +902,13 @@ class LiveTerminal:
             empty_text = Text()
             empty_text.append("\n  ✓ ", style="green")
             empty_text.append("No insider candidates detected\n", style="dim")
-            empty_text.append("    Criteria: $5k+ volume, BUY-only, ≤3 markets, no crypto\n", style="dim italic")
+            empty_text.append("    Criteria: $5k+ single trade, ≤5 trades, BUY-only, no crypto\n", style="dim italic")
             table.add_row(empty_text, "", "", "", "", "", style="dim")
 
         return Panel(
             table,
             title="[bold magenta]🎯 INSIDER CANDIDATES[/bold magenta]",
-            subtitle="$5k+ | BUY-only | ≤3 markets | No crypto gambling",
+            subtitle="$5k+ single trade | ≤5 trades | BUY-only | No crypto",
             border_style="magenta",
             box=box.ROUNDED
         )
@@ -1067,36 +1017,32 @@ class LiveTerminal:
             Layout(name="body")
         )
 
-        # Split body into left and right
+        # Split body into left (Insiders) and right (Feed/Alerts)
         layout["body"].split_row(
-            Layout(name="left", ratio=7),
-            Layout(name="right", ratio=3)
+            Layout(name="left", ratio=4),
+            Layout(name="right", ratio=6)
         )
 
-        # Split left into ticker and panopticon
-        layout["left"].split_column(
-            Layout(name="ticker", ratio=3),
-            Layout(name="panopticon", ratio=2)
-        )
+        # Left column: JUST Insider Candidates (Panopticon)
+        layout["left"].update(self.make_panopticon(self.get_suspicious_wallets(20)))
 
-        # Split right into stats, alerts, and footer
+        # Right column: Split into Feed, Signals, Stats
         layout["right"].split_column(
+            Layout(name="ticker", ratio=4),
+            Layout(name="alerts", ratio=3),
             Layout(name="stats", size=9),
-            Layout(name="alerts", ratio=2),
-            Layout(name="footer", size=4)
+            Layout(name="footer", size=3)
         )
 
         # Update panels
         layout["header"].update(self.make_header())
 
         stats = self.get_stats()
-        wallets = self.get_suspicious_wallets(15)
         alerts = self.get_recent_alerts(10)
 
-        layout["stats"].update(self.make_stats_panel(stats))
         layout["ticker"].update(self.make_ticker())
-        layout["panopticon"].update(self.make_panopticon(wallets))
         layout["alerts"].update(self.make_alerts_panel(alerts))
+        layout["stats"].update(self.make_stats_panel(stats))
         layout["footer"].update(self.make_footer())
 
         return layout
