@@ -88,10 +88,18 @@ class IntelligenceEngine:
         if not wallet_address or not condition_id:
             return alerts
 
+        # STEP 0: Check if this is a day trader (skip if so)
+        is_day_trader = await self._is_day_trader(wallet_address)
+        if is_day_trader:
+            return []  # Day traders are noise, not insiders
+
         # Get market end date for time-to-resolution weighting
         end_date = await self._get_market_end_date(condition_id)
         hours_to_resolution = self._hours_until(end_date)
         urgency_multiplier = self._calculate_urgency_multiplier(hours_to_resolution)
+
+        # Calculate insider boosters for this wallet/trade
+        insider_boost = await self._calculate_insider_boosters(wallet_address, value_usd)
 
         # Run all detection algorithms concurrently
         results = await asyncio.gather(
@@ -108,11 +116,17 @@ class IntelligenceEngine:
             if isinstance(result, dict) and result.get('alert'):
                 # Apply time-to-resolution weighting
                 base_confidence = result.get('confidence_score', 0.5)
-                adjusted_confidence = min(base_confidence * urgency_multiplier, 0.99)
+                
+                # Apply insider boost
+                boosted_confidence = min(base_confidence + insider_boost, 0.99)
+                
+                # Apply urgency multiplier
+                adjusted_confidence = min(boosted_confidence * urgency_multiplier, 0.99)
                 
                 result['wallet_address'] = wallet_address
                 result['condition_id'] = condition_id
                 result['urgency_multiplier'] = urgency_multiplier
+                result['insider_boost'] = insider_boost
                 result['adjusted_confidence'] = adjusted_confidence
                 result['hours_to_resolution'] = hours_to_resolution
                 
@@ -135,6 +149,147 @@ class IntelligenceEngine:
         alerts.extend(triggered_alerts)
 
         return alerts
+
+    # ============================================================
+    # Day Trader Detection (Filter Out)
+    # ============================================================
+
+    async def _is_day_trader(self, wallet_address: str) -> bool:
+        """
+        Check if wallet exhibits day trader behavior
+        
+        Day traders:
+        - Trade frequently (20+ trades/week)
+        - Trade many markets (10+ different markets)
+        - Make small consistent bets (<$500 avg, low variance)
+        
+        Returns True if wallet is likely a day trader (should skip)
+        """
+        try:
+            cursor = self.db_conn.cursor()
+            
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as trades_7d,
+                    COUNT(DISTINCT condition_id) as unique_markets,
+                    AVG(value_usd) as avg_trade,
+                    STDDEV(value_usd) / NULLIF(AVG(value_usd), 0) as cv
+                FROM trades
+                WHERE 
+                    wallet_address = %s
+                    AND executed_at >= NOW() - INTERVAL '7 days'
+            """, (wallet_address,))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if not result or result[0] is None:
+                return False
+            
+            trades, markets, avg_size, cv = result
+            trades = trades or 0
+            markets = markets or 0
+            avg_size = float(avg_size) if avg_size else 0
+            cv = float(cv) if cv else 1
+            
+            # Day trader criteria (must meet multiple)
+            high_frequency = trades >= 20
+            high_diversity = markets >= 10
+            small_bets = avg_size < 500
+            consistent_sizing = cv < 0.5  # Low coefficient of variation
+            
+            # Need at least 3 out of 4 criteria
+            score = sum([high_frequency, high_diversity, small_bets, consistent_sizing])
+            
+            is_day_trader = score >= 3
+            
+            # Update wallet flag in database
+            if is_day_trader:
+                try:
+                    update_cursor = self.db_conn.cursor()
+                    update_cursor.execute("""
+                        UPDATE wallets SET is_day_trader = TRUE
+                        WHERE address = %s
+                    """, (wallet_address,))
+                    self.db_conn.commit()
+                    update_cursor.close()
+                except Exception:
+                    pass
+            
+            return is_day_trader
+            
+        except Exception:
+            return False
+
+    # ============================================================
+    # Insider Confidence Boosters
+    # ============================================================
+
+    async def _calculate_insider_boosters(self, wallet_address: str, trade_value: float) -> float:
+        """
+        Calculate confidence boost from insider signals
+        
+        Boosters:
+        - Conviction bet (trade is >50% of 7-day volume): +15%
+        - Market focus (traded ≤3 markets ever): +10%
+        - Low frequency (<5 trades in 7 days): +10%
+        - High win rate (>70%): +10%
+        
+        Returns total boost (0.0 to 0.45)
+        """
+        boost = 0.0
+        
+        try:
+            cursor = self.db_conn.cursor()
+            
+            # Get wallet stats
+            cursor.execute("""
+                SELECT 
+                    w.total_volume_usd,
+                    w.win_rate,
+                    (SELECT COUNT(DISTINCT condition_id) FROM trades WHERE wallet_address = %s) as unique_markets,
+                    (SELECT COUNT(*) FROM trades WHERE wallet_address = %s AND executed_at >= NOW() - INTERVAL '7 days') as trades_7d,
+                    (SELECT COALESCE(SUM(value_usd), 0) FROM trades WHERE wallet_address = %s AND executed_at >= NOW() - INTERVAL '7 days') as volume_7d
+                FROM wallets w
+                WHERE w.address = %s
+            """, (wallet_address, wallet_address, wallet_address, wallet_address))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if not result:
+                return 0.0
+            
+            total_volume, win_rate, unique_markets, trades_7d, volume_7d = result
+            
+            # Convert to proper types
+            volume_7d = float(volume_7d) if volume_7d else 0
+            win_rate = float(win_rate) if win_rate else 0
+            unique_markets = unique_markets or 0
+            trades_7d = trades_7d or 0
+            
+            # Conviction bet (this trade is large relative to their recent history)
+            if volume_7d > 0:
+                conviction_ratio = trade_value / volume_7d
+                if conviction_ratio > 0.5:
+                    boost += 0.15  # This is a BIG bet for them
+            
+            # Market focus (they don't trade many markets)
+            if unique_markets <= 3:
+                boost += 0.10  # Focused, not a gambler
+            
+            # Low frequency (not trading frequently)
+            if trades_7d < 5:
+                boost += 0.10  # Selective trader
+            
+            # Historical accuracy (they win more than they should)
+            if win_rate > 0.70:
+                boost += 0.10  # Suspiciously accurate
+            
+        except Exception:
+            pass
+        
+        return min(boost, 0.45)  # Cap at 45% boost
 
     # ============================================================
     # Composite Signal Scoring

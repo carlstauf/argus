@@ -503,6 +503,8 @@ class LiveTerminal:
         
         CRITICAL: We now verify each wallet's age via the Polymarket API to prevent
         showing old wallets that we just started tracking.
+        
+        Also filters out day traders (high frequency, many markets).
         """
         from src.api.polymarket_client import PolymarketClient
         
@@ -526,6 +528,8 @@ class LiveTerminal:
                 AND w.freshness_score >= 70
                 -- Must have significant volume
                 AND w.total_volume_usd > 100
+                -- EXCLUDE day traders
+                AND (w.is_day_trader IS NULL OR w.is_day_trader = FALSE)
             ORDER BY w.freshness_score DESC, w.total_volume_usd DESC
             LIMIT %s
         """, (limit * 3,))  # Get more candidates since we'll filter some out
