@@ -79,24 +79,45 @@ class ArgusDashboard:
         Get recently active fresh wallets - filtered for TRUE INSIDERS
         
         Filters out:
-        - Day traders (wallets with both BUY and SELL on same market = churning)
+        - Day traders (wallets with BOTH BUY and SELL trades)
+        - Wallets trading crypto/gambling markets (bitcoin, ethereum, up or down)
         - Wallets flagged as is_day_trader
+        
+        True insiders make ONE-DIRECTIONAL bets on INSIDER markets, not crypto gambling.
         """
         cursor = self.db_conn.cursor()
         cursor.execute("""
-            WITH churning_wallets AS (
-                -- Find wallets that have traded BOTH sides on any market recently
-                SELECT DISTINCT wallet_address
-                FROM (
-                    SELECT 
-                        wallet_address,
-                        condition_id,
-                        COUNT(DISTINCT side) as sides_traded
-                    FROM trades
-                    WHERE executed_at >= NOW() - INTERVAL '7 days'
-                    GROUP BY wallet_address, condition_id
-                    HAVING COUNT(DISTINCT side) > 1  -- Both BUY and SELL
-                ) sub
+            WITH day_traders AS (
+                -- Wallets that have BOTH buy AND sell trades = day traders
+                SELECT wallet_address
+                FROM trades
+                WHERE executed_at >= NOW() - INTERVAL '7 days'
+                GROUP BY wallet_address
+                HAVING 
+                    COUNT(CASE WHEN side = 'BUY' THEN 1 END) > 0 
+                    AND COUNT(CASE WHEN side = 'SELL' THEN 1 END) > 0
+            ),
+            crypto_gamblers AS (
+                -- Wallets primarily trading crypto/gambling markets
+                SELECT DISTINCT t.wallet_address
+                FROM trades t
+                JOIN markets m ON t.condition_id = m.condition_id
+                WHERE 
+                    t.executed_at >= NOW() - INTERVAL '7 days'
+                    AND (
+                        LOWER(m.question) LIKE '%%bitcoin%%'
+                        OR LOWER(m.question) LIKE '%%btc%%'
+                        OR LOWER(m.question) LIKE '%%ethereum%%'
+                        OR LOWER(m.question) LIKE '%%eth %%'
+                        OR LOWER(m.question) LIKE '%%crypto%%'
+                        OR LOWER(m.question) LIKE '%%up or down%%'
+                        OR LOWER(m.question) LIKE '%%xrp%%'
+                        OR LOWER(m.question) LIKE '%%solana%%'
+                        OR LOWER(m.question) LIKE '%%sol %%'
+                        OR LOWER(m.question) LIKE '%%doge%%'
+                        OR LOWER(m.question) LIKE '%%price above%%'
+                        OR LOWER(m.question) LIKE '%%price below%%'
+                    )
             )
             SELECT
                 w.address,
@@ -109,7 +130,8 @@ class ArgusDashboard:
             WHERE
                 w.freshness_score >= 70
                 AND w.total_volume_usd > 1000
-                AND w.address NOT IN (SELECT wallet_address FROM churning_wallets)
+                AND w.address NOT IN (SELECT wallet_address FROM day_traders)
+                AND w.address NOT IN (SELECT wallet_address FROM crypto_gamblers)
                 AND COALESCE(w.is_day_trader, FALSE) = FALSE
             ORDER BY w.last_active_at DESC
             LIMIT %s
