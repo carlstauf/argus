@@ -219,7 +219,7 @@ class LiveTerminal:
                 (SELECT SUM(value_usd) FROM trades WHERE condition_id = m.condition_id AND executed_at > NOW() - INTERVAL '24h') as volume_24h
             FROM markets m
             WHERE 
-                m.active = TRUE 
+                m.status = 'ACTIVE' 
                 AND m.question NOT LIKE '%%vs%%' -- Ignore sports for now to focus on events
                 AND m.question NOT LIKE '%%Bitcoin%%'
             ORDER BY volume_24h DESC
