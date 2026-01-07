@@ -75,9 +75,29 @@ class ArgusDashboard:
         return alerts
 
     def get_fresh_wallets(self, limit: int = 10) -> List[Dict]:
-        """Get recently active fresh wallets"""
+        """
+        Get recently active fresh wallets - filtered for TRUE INSIDERS
+        
+        Filters out:
+        - Day traders (wallets with both BUY and SELL on same market = churning)
+        - Wallets flagged as is_day_trader
+        """
         cursor = self.db_conn.cursor()
         cursor.execute("""
+            WITH churning_wallets AS (
+                -- Find wallets that have traded BOTH sides on any market recently
+                SELECT DISTINCT wallet_address
+                FROM (
+                    SELECT 
+                        wallet_address,
+                        condition_id,
+                        COUNT(DISTINCT side) as sides_traded
+                    FROM trades
+                    WHERE executed_at >= NOW() - INTERVAL '7 days'
+                    GROUP BY wallet_address, condition_id
+                    HAVING COUNT(DISTINCT side) > 1  -- Both BUY and SELL
+                ) sub
+            )
             SELECT
                 w.address,
                 w.first_seen_at,
@@ -89,6 +109,8 @@ class ArgusDashboard:
             WHERE
                 w.freshness_score >= 70
                 AND w.total_volume_usd > 1000
+                AND w.address NOT IN (SELECT wallet_address FROM churning_wallets)
+                AND COALESCE(w.is_day_trader, FALSE) = FALSE
             ORDER BY w.last_active_at DESC
             LIMIT %s
         """, (limit,))
