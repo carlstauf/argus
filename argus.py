@@ -203,41 +203,14 @@ class LiveTerminal:
 
     async def ingest_oracle(self) -> List[Dict]:
         """
-        Background process to feed markets to the Oracle
-        Runs less frequently (every 10s) to respect API limits
+        Fetch Oracle insights by scraping Polymarket directly.
+        The Oracle handles scraping, filtering, and Gemini analysis.
         """
         if not self.oracle.model:
             return []
-            
-        # Get top active markets from DB for analysis
-        cursor = self.db_conn.cursor()
-        cursor.execute("""
-            SELECT 
-                m.condition_id, 
-                m.question, 
-                (SELECT price FROM trades WHERE condition_id = m.condition_id ORDER BY executed_at DESC LIMIT 1) as price,
-                (SELECT SUM(value_usd) FROM trades WHERE condition_id = m.condition_id AND executed_at > NOW() - INTERVAL '24h') as volume_24h
-            FROM markets m
-            WHERE 
-                m.status = 'ACTIVE' 
-                AND m.question NOT LIKE '%%vs%%' -- Ignore sports for now to focus on events
-                AND m.question NOT LIKE '%%Bitcoin%%'
-            ORDER BY volume_24h DESC
-            LIMIT 20
-        """)
         
-        markets = []
-        for row in cursor.fetchall():
-            markets.append({
-                'condition_id': row[0],
-                'question': row[1],
-                'price': float(row[2]) if row[2] else 0.5,
-                'volume_24h': float(row[3]) if row[3] else 0
-            })
-        cursor.close()
-        
-        # Scan for mispricing
-        insights = await self.oracle.scan_markets(markets)
+        # Let Oracle scrape and analyze directly (includes links)
+        insights = await self.oracle.scan_markets()  # No args = scrape fresh
         if insights:
             self.oracle_insights = insights
             
@@ -1044,68 +1017,88 @@ class LiveTerminal:
         return layout
 
     def make_oracle_panel(self, insights: List[Dict]) -> Panel:
-        """Create THE ORACLE panel - AI Reality Check"""
-        table = Table(
-            show_header=True,
-            header_style="bold yellow",
-            box=box.SIMPLE,
-            expand=True,
-            show_lines=False
-        )
-
-        table.add_column("Market", style="white", ratio=2)
-        table.add_column("Mkt %", justify="right", style="dim white", width=6)
-        table.add_column("Real %", justify="right", style="bold green", width=6)
-        table.add_column("Verdict", justify="center", width=12)
-        table.add_column("Reasoning", style="dim", ratio=3)
-
+        """Create THE ORACLE panel - AI-powered trade signals with links"""
+        from rich.align import Align
+        
         if not self.oracle.model:
-            # Disabled state
             return Panel(
-                Text("\nGemini API Key missing. Oracle disabled.\n", justify="center", style="yellow"),
-                title="[bold yellow]👁️ THE ORACLE[/bold yellow]",
+                Align.center(Text("\n⚠️ GEMINI_API_KEY missing\nOracle disabled\n", style="yellow")),
+                title="[bold yellow]🔮 THE ORACLE[/bold yellow]",
                 border_style="yellow",
                 box=box.ROUNDED
             )
 
         if not insights:
-            # Loading or empty state
-            empty_text = Text("\nWaiting for visions...\nScanning markets for reality gaps...", style="dim italic", justify="center")
+            loading = Text()
+            loading.append("\n🔍 Scanning Polymarket...\n", style="dim")
+            loading.append("Triple-checking for mispriced bets\n", style="dim italic")
             return Panel(
-                empty_text,
-                title="[bold yellow]👁️ THE ORACLE[/bold yellow]",
-                subtitle="Scanning for Mispriced Reality",
+                Align.center(loading),
+                title="[bold yellow]🔮 THE ORACLE[/bold yellow]",
+                subtitle="Gemini 3 Flash",
                 border_style="yellow",
                 box=box.ROUNDED
             )
 
-        for item in insights:
-            q = item.get('question', 'Unknown')
-            mkt_prob = item.get('market_price', 0) * 100
-            real_prob = item.get('estimated_real_odds', 0)
-            verdict = item.get('verdict', 'UNKNOWN')
-            reason = item.get('reasoning', '')
+        # Build table with all info
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=box.SIMPLE_HEAD,
+            expand=True,
+            pad_edge=False
+        )
+
+        table.add_column("Action", justify="center", width=10)
+        table.add_column("Market", style="white", ratio=3, no_wrap=False)
+        table.add_column("Edge", justify="right", width=6, style="green")
+        table.add_column("Conf", justify="right", width=5)
+        table.add_column("Link", width=12)
+
+        for item in insights[:8]:  # Limit to 8 to avoid overflow
+            action = item.get('action', 'NO TRADE')
+            question = item.get('question', 'Unknown')[:60]  # Truncate
+            edge = item.get('edge_percent', 0)
+            conf = item.get('confidence', 0)
+            link = item.get('link', '')
             
-            # Format Verdict
-            if verdict == 'UNDERVALUED':
-                verdict_styled = "[bold green]BUY YES[/bold green]"
-            elif verdict == 'OVERVALUED':
-                verdict_styled = "[bold red]SELL YES[/bold red]"
+            # Format action with color
+            if action == 'BUY YES':
+                action_styled = "[bold green]🟢 YES[/bold green]"
+            elif action == 'BUY NO':
+                action_styled = "[bold red]🔴 NO[/bold red]"
             else:
-                verdict_styled = f"[dim]{verdict}[/dim]"
+                action_styled = "[dim]⚪ SKIP[/dim]"
+            
+            # Format edge
+            edge_styled = f"+{edge}%" if edge > 0 else f"{edge}%"
+            
+            # Format confidence with color
+            if conf >= 90:
+                conf_styled = f"[bold green]{conf}%[/bold green]"
+            elif conf >= 75:
+                conf_styled = f"[yellow]{conf}%[/yellow]"
+            else:
+                conf_styled = f"[dim]{conf}%[/dim]"
+            
+            # Clickable link (shortened)
+            if link:
+                link_text = Text("→ Trade", style=Style(link=link, color="cyan", underline=True))
+            else:
+                link_text = Text("-", style="dim")
 
             table.add_row(
-                q,
-                f"{mkt_prob:.0f}%",
-                f"{real_prob:.0f}%",
-                verdict_styled,
-                reason
+                action_styled,
+                question,
+                edge_styled,
+                conf_styled,
+                link_text
             )
 
         return Panel(
             table,
-            title="[bold yellow]👁️ THE ORACLE[/bold yellow]",
-            subtitle="AI Reality Check (Gemini 1.5)",
+            title="[bold yellow]🔮 THE ORACLE[/bold yellow]",
+            subtitle=f"[dim]{len(insights)} signals | Click 'Trade' to open[/dim]",
             border_style="yellow",
             box=box.ROUNDED
         )
